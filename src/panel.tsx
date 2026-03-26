@@ -18,8 +18,13 @@ import {
   DropdownButton
 } from './actions';
 import { buildSystemPrompt } from './systemPrompt';
-import { IFilter, applyFilters } from './filter';
-import { NotebookFileReader } from './notebookFile';
+import {
+  NblibramLiveQuery,
+  nblibramTocFromFile,
+  nblibramSectionFromFile,
+  nblibramCellsFromFile,
+  nblibramOutputsFromFile
+} from './nblibram';
 import { mynervaIcon } from './icons';
 
 const PANEL_CLASS = 'jp-Mynerva-panel';
@@ -34,6 +39,7 @@ interface IMessage {
 interface IConfig {
   provider: string;
   model: string;
+  decryptError?: string;
   apiKey: string;
   useDefault?: boolean;
 }
@@ -53,7 +59,6 @@ interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
-  filters: IFilter[];
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -258,6 +263,7 @@ interface ISettingsViewProps {
   defaults: IDefaultConfig | null;
   defaultsUnavailable: boolean;
   onSave: (config: IConfig) => void;
+  warning?: string;
 }
 
 function SettingsView({
@@ -266,7 +272,8 @@ function SettingsView({
   encryption,
   defaults,
   defaultsUnavailable,
-  onSave
+  onSave,
+  warning
 }: ISettingsViewProps): React.ReactElement {
   const [useDefault, setUseDefault] = React.useState(
     defaultsUnavailable ? false : (config.useDefault ?? false)
@@ -325,7 +332,7 @@ function SettingsView({
       )}
       {!useDefault && (
         <>
-          {!encryption && (
+          {!encryption && !warning && (
             <div className="jp-Mynerva-settings-warning">
               API keys are stored unencrypted. Set MYNERVA_SECRET_KEY for
               encryption.
@@ -365,6 +372,7 @@ function SettingsView({
           </div>
         </>
       )}
+      {warning && <div className="jp-Mynerva-settings-error">{warning}</div>}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
       <button
         className="jp-Mynerva-settings-save"
@@ -687,10 +695,12 @@ function ChatView({
 
 interface IMynervaComponentProps {
   contextEngine: ContextEngine;
+  liveQuery: NblibramLiveQuery;
 }
 
 function MynervaComponent({
-  contextEngine
+  contextEngine,
+  liveQuery
 }: IMynervaComponentProps): React.ReactElement {
   const [providers, setProviders] = React.useState<IProvider[]>([]);
   const [encryption, setEncryption] = React.useState(false);
@@ -701,8 +711,8 @@ function MynervaComponent({
   const [loading, setLoading] = React.useState(false);
   const [initializing, setInitializing] = React.useState(true);
   const [initError, setInitError] = React.useState<string | null>(null);
-  const [filters, setFilters] = React.useState<IFilter[]>([]);
   const [filterEnabled, setFilterEnabled] = React.useState(true);
+  liveQuery.filterEnabled = filterEnabled;
   // Auto-approval for active notebook: Map<notebookPath, Set<actionType>>
   const [autoApproved, setAutoApproved] = React.useState<
     Map<string, Set<ActionType>>
@@ -726,18 +736,16 @@ function MynervaComponent({
   React.useEffect(() => {
     Promise.all([getProviders(), getConfig(), getSessions()])
       .then(async ([providersRes, cfg, sessionsRes]) => {
-        if (!providersRes.filters) {
-          throw new Error('Server did not return privacy filter configuration');
-        }
         setProviders(providersRes.providers);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
-        setFilters(providersRes.filters);
         setConfig(cfg);
         setSessions(sessionsRes.sessions);
         setSessionLoadErrors(sessionsRes.errors);
 
-        // Start with empty new session (don't auto-load past sessions)
+        if (cfg.decryptError) {
+          setShowSettings(true);
+        }
 
         // Show settings if:
         // - no API key and not using defaults, OR
@@ -763,10 +771,6 @@ function MynervaComponent({
   // Queue of action results waiting to be sent
   const [pendingResults, setPendingResults] = React.useState<string[]>([]);
 
-  // NotebookFileReader for file queries
-  const fileReaderRef = React.useRef<NotebookFileReader>(
-    new NotebookFileReader()
-  );
 
   // Flag to prevent duplicate execution from useEffect during batch operations
   const executingActionsRef = React.useRef(false);
@@ -836,36 +840,32 @@ function MynervaComponent({
     let result: string;
     switch (action.type) {
       case 'getToc': {
-        const path = contextEngine.getNotebookPath();
-        const toc = contextEngine.getToc();
-        result = JSON.stringify({ type: 'getToc', path, result: toc }, null, 2);
+        const toc = await liveQuery.getToc();
+        result = JSON.stringify({ type: 'getToc', result: toc }, null, 2);
         break;
       }
       case 'getSection': {
-        const path = contextEngine.getNotebookPath();
-        const cells = contextEngine.getSection(action.query);
+        const cells = await liveQuery.getSection(action.query);
         result = JSON.stringify(
-          { type: 'getSection', path, result: cells },
+          { type: 'getSection', result: cells },
           null,
           2
         );
         break;
       }
       case 'getCells': {
-        const path = contextEngine.getNotebookPath();
-        const cells = contextEngine.queryCells(action.query, action.count);
+        const cells = await liveQuery.getCells(action.query, action.count);
         result = JSON.stringify(
-          { type: 'getCells', path, result: cells },
+          { type: 'getCells', result: cells },
           null,
           2
         );
         break;
       }
       case 'getOutput': {
-        const path = contextEngine.getNotebookPath();
-        const outputs = contextEngine.getOutput(action.query);
+        const outputs = await liveQuery.getOutput(action.query);
         result = JSON.stringify(
-          { type: 'getOutput', path, result: outputs },
+          { type: 'getOutput', result: outputs },
           null,
           2
         );
@@ -888,8 +888,12 @@ function MynervaComponent({
         break;
       }
       case 'listNotebookFiles': {
-        const fileReader = fileReaderRef.current;
-        const files = await fileReader.listNotebooks(action.path || '');
+        const { ContentsManager } = await import('@jupyterlab/services');
+        const contents = new ContentsManager();
+        const model = await contents.get(action.path || '');
+        const files = (model.content as { type: string; path: string }[])
+          .filter(item => item.type === 'notebook')
+          .map(item => item.path);
         result = JSON.stringify(
           { type: 'listNotebookFiles', path: action.path || '', result: files },
           null,
@@ -898,8 +902,7 @@ function MynervaComponent({
         break;
       }
       case 'getTocFromFile': {
-        const fileReader = fileReaderRef.current;
-        const toc = await fileReader.getToc(action.path);
+        const toc = await nblibramTocFromFile(action.path);
         result = JSON.stringify(
           { type: 'getTocFromFile', path: action.path, result: toc },
           null,
@@ -908,8 +911,7 @@ function MynervaComponent({
         break;
       }
       case 'getSectionFromFile': {
-        const fileReader = fileReaderRef.current;
-        const cells = await fileReader.getSection(action.path, action.query);
+        const cells = await nblibramSectionFromFile(action.path, action.query);
         result = JSON.stringify(
           { type: 'getSectionFromFile', path: action.path, result: cells },
           null,
@@ -918,8 +920,7 @@ function MynervaComponent({
         break;
       }
       case 'getCellsFromFile': {
-        const fileReader = fileReaderRef.current;
-        const cells = await fileReader.getCells(
+        const cells = await nblibramCellsFromFile(
           action.path,
           action.query,
           action.count
@@ -932,8 +933,7 @@ function MynervaComponent({
         break;
       }
       case 'getOutputFromFile': {
-        const fileReader = fileReaderRef.current;
-        const outputs = await fileReader.getOutput(action.path, action.query);
+        const outputs = await nblibramOutputsFromFile(action.path, action.query);
         result = JSON.stringify(
           { type: 'getOutputFromFile', path: action.path, result: outputs },
           null,
@@ -949,9 +949,6 @@ function MynervaComponent({
         );
     }
 
-    if (filterEnabled && filters.length > 0) {
-      result = applyFilters(result, filters);
-    }
     return result;
   };
 
@@ -1583,6 +1580,7 @@ function MynervaComponent({
           defaults={defaults}
           defaultsUnavailable={!!(config?.useDefault && !defaults)}
           onSave={handleConfigSave}
+          warning={config?.decryptError}
         />
       ) : (
         <ChatView
@@ -1608,10 +1606,12 @@ function MynervaComponent({
 
 export class MynervaPanel extends ReactWidget {
   private _contextEngine: ContextEngine;
+  private _liveQuery: NblibramLiveQuery;
 
-  constructor(contextEngine: ContextEngine) {
+  constructor(contextEngine: ContextEngine, liveQuery: NblibramLiveQuery) {
     super();
     this._contextEngine = contextEngine;
+    this._liveQuery = liveQuery;
     this.id = 'mynerva-panel';
     this.title.icon = mynervaIcon;
     this.title.caption = 'Mynerva';
@@ -1619,14 +1619,20 @@ export class MynervaPanel extends ReactWidget {
   }
 
   render(): React.ReactElement {
-    return <MynervaComponent contextEngine={this._contextEngine} />;
+    return (
+      <MynervaComponent
+        contextEngine={this._contextEngine}
+        liveQuery={this._liveQuery}
+      />
+    );
   }
 }
 
 export function activatePanel(
   shell: ILabShell,
-  contextEngine: ContextEngine
+  contextEngine: ContextEngine,
+  liveQuery: NblibramLiveQuery
 ): void {
-  const panel = new MynervaPanel(contextEngine);
+  const panel = new MynervaPanel(contextEngine, liveQuery);
   shell.add(panel, 'right', { rank: 1000 });
 }

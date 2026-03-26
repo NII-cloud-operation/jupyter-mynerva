@@ -1,6 +1,9 @@
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -206,7 +209,11 @@ def load_config():
     if config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
-        config['apiKey'] = decrypt_api_key(config.get('apiKey', ''))
+        try:
+            config['apiKey'] = decrypt_api_key(config.get('apiKey', ''))
+        except ValueError:
+            config['apiKey'] = ''
+            config['decryptError'] = 'MYNERVA_SECRET_KEY is required to decrypt stored API key'
         return config
 
     # Config doesn't exist - check if defaults are available
@@ -461,6 +468,66 @@ class SessionHandler(APIHandler):
             self.finish(json.dumps({'error': 'Session not found'}))
 
 
+# Per-notebook store for live document content
+_notebook_stores = {}  # notebook_path -> temp file path
+
+
+def _get_store_path(notebook_path):
+    if notebook_path not in _notebook_stores:
+        fd, path = tempfile.mkstemp(suffix='.ipynb', prefix='nblibram-')
+        os.close(fd)
+        _notebook_stores[notebook_path] = path
+    return _notebook_stores[notebook_path]
+
+
+class NblibramHandler(APIHandler):
+    @tornado.web.authenticated
+    def post(self):
+        nblibram_path = shutil.which('nblibram')
+        if not nblibram_path:
+            self.set_status(500)
+            self.finish(json.dumps({'error': 'nblibram not found in PATH'}))
+            return
+
+        data = self.get_json_body()
+        command = data.get('command', '')
+        args = data.get('args', [])
+        notebook_path = data.get('notebookPath')
+        notebook_content = data.get('notebookContent')
+        self.log.info('nblibram request: command=%s, path=%s, has_content=%s, args=%s',
+                      command, notebook_path, notebook_content is not None, args)
+
+        # Update store if content provided (dirty sync)
+        if notebook_path and notebook_content is not None:
+            store_path = _get_store_path(notebook_path)
+            with open(store_path, 'w') as f:
+                json.dump(notebook_content, f)
+
+        # If command targets the live notebook, use the store file
+        if notebook_path and '-file' not in args:
+            store_path = _get_store_path(notebook_path)
+            if not os.path.exists(store_path):
+                self.set_status(400)
+                self.finish(json.dumps({'error': 'No notebook content in store. Send notebookContent first.'}))
+                return
+            args = ['-file', store_path] + args
+
+        cmd = [nblibram_path, command] + args
+        self.log.info('nblibram: %s', ' '.join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            self.set_status(400)
+            self.finish(json.dumps({'error': result.stderr.strip()}))
+            return
+
+        try:
+            parsed = json.loads(result.stdout)
+            self.finish(json.dumps(parsed))
+        except json.JSONDecodeError:
+            self.finish(json.dumps({'output': result.stdout}))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -470,12 +537,14 @@ def setup_route_handlers(web_app):
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
+    nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
     handlers = [
         (providers_pattern, ProvidersHandler),
         (config_pattern, ConfigHandler),
         (chat_pattern, ChatHandler),
         (sessions_pattern, SessionsHandler),
-        (session_pattern, SessionHandler)
+        (session_pattern, SessionHandler),
+        (nblibram_pattern, NblibramHandler)
     ]
 
     web_app.add_handlers(host_pattern, handlers)
