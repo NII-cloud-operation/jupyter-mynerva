@@ -124,3 +124,8 @@ dmypy.json
 .yarn/
 
 .nbsearchignore
+
+# Galata
+ui-tests/node_modules/
+ui-tests/test-results/
+ui-tests/playwright-report/
