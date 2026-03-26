@@ -74,4 +74,19 @@ test.describe('Echo Agent', () => {
     expect(result).toContain('Section Two');
     expect(result).toContain('y = 2');
   });
+
+  test('listHelp returns system prompt', async ({ page }) => {
+    await page.getByRole('tab', { name: 'Mynerva' }).click();
+    const result = await sendAndApprove(page, 'list help', 'listHelp');
+    expect(result).toContain('Available actions');
+    expect(result).toContain('getToc');
+  });
+
+  test('help returns action details', async ({ page }) => {
+    await page.getByRole('tab', { name: 'Mynerva' }).click();
+    const result = await sendAndApprove(page, 'help', 'help');
+    // Echo agent requests help for 'getToc'
+    expect(result).toContain('getToc: Get heading structure of current notebook');
+    expect(result).toContain('Required: (none)');
+  });
 });

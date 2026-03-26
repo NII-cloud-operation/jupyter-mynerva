@@ -17,7 +17,7 @@ import {
   MutateActionCard,
   DropdownButton
 } from './actions';
-import { buildSystemPrompt } from './systemPrompt';
+import { buildSystemPrompt, getActionHelp } from './systemPrompt';
 import {
   NblibramLiveQuery,
   nblibramTocFromFile,
@@ -598,7 +598,9 @@ const QUERY_ACTION_TYPES = [
   'getTocFromFile',
   'getSectionFromFile',
   'getCellsFromFile',
-  'getOutputFromFile'
+  'getOutputFromFile',
+  'listHelp',
+  'help'
 ];
 const MUTATE_ACTION_TYPES = [
   'insertCell',
@@ -1076,7 +1078,7 @@ function MynervaComponent({
       }
       case 'help': {
         result = JSON.stringify(
-          { type: 'help', result: `Help for action: ${action.action}` },
+          { type: 'help', result: getActionHelp(action.action) },
           null,
           2
         );

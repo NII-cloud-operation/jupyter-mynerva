@@ -11,6 +11,8 @@ _TRIGGERS = {
     'cells': {'type': 'getCells', 'query': {'start': 0}, 'count': 2},
     'section': {'type': 'getSection', 'query': {'start': 0}},
     'output': {'type': 'getOutput', 'query': {'start': 0}},
+    'list help': {'type': 'listHelp'},
+    'help': {'type': 'help', 'action': 'getToc'},
 }
 
 

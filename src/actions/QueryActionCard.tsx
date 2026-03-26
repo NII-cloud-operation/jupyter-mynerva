@@ -30,6 +30,10 @@ function getActionLabel(action: IQueryAction): string {
       return `Get Cells from ${action.path}: ${JSON.stringify(action.query)}${action.count ? ` (count: ${action.count})` : ''}`;
     case 'getOutputFromFile':
       return `Get Output from ${action.path}: ${JSON.stringify(action.query)}`;
+    case 'listHelp':
+      return 'Show available actions';
+    case 'help':
+      return `Help: ${action.action}`;
     default:
       return 'Unknown Action';
   }
