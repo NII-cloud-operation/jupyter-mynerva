@@ -1,12 +1,17 @@
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+import cachetools
 
 try:
     import tomllib
@@ -489,8 +494,22 @@ class SessionHandler(APIHandler):
             self.finish(json.dumps({'error': 'Session not found'}))
 
 
-# Per-notebook store for live document content
-_notebook_stores = {}  # notebook_path -> temp file path
+# Per-notebook store for live document content.
+# LRU eviction cleans up temp files when capacity is exceeded.
+class _NotebookStore(cachetools.LRUCache):
+    def __init__(self, maxsize=16):
+        super().__init__(maxsize=maxsize)
+        self._log = logging.getLogger(__name__)
+
+    def __delitem__(self, key):
+        path = self[key]
+        super().__delitem__(key)
+        try:
+            os.unlink(path)
+        except OSError as e:
+            self._log.warning("Failed to remove store file %s: %s", path, e)
+
+_notebook_stores = _NotebookStore()
 
 
 def _get_store_path(notebook_path):
@@ -515,9 +534,6 @@ class NblibramHandler(APIHandler):
         args = data.get('args', [])
         notebook_path = data.get('notebookPath')
         notebook_content = data.get('notebookContent')
-        self.log.info('nblibram request: command=%s, path=%s, has_content=%s, args=%s',
-                      command, notebook_path, notebook_content is not None, args)
-
         # Update store if content provided (dirty sync)
         if notebook_path and notebook_content is not None:
             store_path = _get_store_path(notebook_path)
@@ -534,7 +550,6 @@ class NblibramHandler(APIHandler):
             args = ['-file', store_path] + args
 
         cmd = [nblibram_path, command] + args
-        self.log.info('nblibram: %s', ' '.join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
@@ -559,7 +574,7 @@ class EnkiGateDeviceFlowHandler(APIHandler):
             self.finish(json.dumps({'error': 'enkiGateUrl is required'}))
             return
 
-        import urllib.request
+
         req = urllib.request.Request(f'{enki_url}/api/device-flows', method='POST')
         try:
             with urllib.request.urlopen(req) as resp:
@@ -580,7 +595,7 @@ class EnkiGateDeviceFlowPollHandler(APIHandler):
             self.finish(json.dumps({'error': 'enkiGateUrl is required'}))
             return
 
-        import urllib.request
+
         req = urllib.request.Request(
             f'{enki_url}/api/device-flows/{device_code}/poll',
             method='POST'

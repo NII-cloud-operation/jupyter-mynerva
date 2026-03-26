@@ -37,17 +37,7 @@ export type ICellQuery =
   | ISelectedQuery;
 
 /**
- * Table of contents entry
- */
-export interface ITocEntry {
-  level: number;
-  text: string;
-  cellIndex: number;
-  cellId: string;
-}
-
-/**
- * Cell data for LLM (outputs excluded - use getOutput for outputs)
+ * Cell data returned by mutation operations
  */
 export interface ICellData {
   index: number;
@@ -57,15 +47,6 @@ export interface ICellData {
   isActive: boolean;
   isSelected: boolean;
   _hash: string;
-}
-
-/**
- * Output data for LLM
- */
-export interface IOutputData {
-  outputType: string;
-  text?: string;
-  data?: Record<string, unknown>;
 }
 
 /**
