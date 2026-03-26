@@ -1,6 +1,6 @@
 import { ILabShell } from '@jupyterlab/application';
 import { ServerConnection } from '@jupyterlab/services';
-import { ReactWidget, settingsIcon } from '@jupyterlab/ui-components';
+import { ReactWidget, settingsIcon, copyIcon } from '@jupyterlab/ui-components';
 import * as React from 'react';
 import { marked } from 'marked';
 
@@ -42,6 +42,10 @@ interface IConfig {
   decryptError?: string;
   apiKey: string;
   useDefault?: boolean;
+  enkiGateUrl?: string;
+  enkiGateToken?: string;
+  enkiGateModel?: string;
+  enkiGateExpiresAt?: number;
 }
 
 interface IDefaultConfig {
@@ -266,6 +270,177 @@ interface ISettingsViewProps {
   warning?: string;
 }
 
+function CopyableCode({ code }: { code: string }): React.ReactElement {
+  const [copied, setCopied] = React.useState(false);
+
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div style={{ textAlign: 'center' }}>
+      <div style={{ fontSize: '0.85em', color: '#666', marginBottom: '4px' }}>and enter this code</div>
+      <div
+        style={{ fontSize: '1.8em', fontWeight: 'bold', letterSpacing: '0.1em', color: '#333', cursor: 'pointer' }}
+        title="Click to copy"
+        onClick={handleCopy}
+      >
+        {code}{' '}
+        <span style={{ verticalAlign: 'middle', marginLeft: '4px', display: 'inline-block' }}>
+          <copyIcon.react tag="span" width="16px" height="16px" />
+        </span>
+      </div>
+      {copied && (
+        <div style={{ fontSize: '0.8em', color: '#4a86c8', marginTop: '4px' }}>Copied!</div>
+      )}
+    </div>
+  );
+}
+
+function EnkiGateSettings({
+  config,
+  onSave
+}: {
+  config: IConfig;
+  onSave: (config: IConfig) => void;
+}): React.ReactElement {
+  const [enkiUrl, setEnkiUrl] = React.useState(
+    config.enkiGateUrl || 'https://enki-gate.web.app'
+  );
+  const [connecting, setConnecting] = React.useState(false);
+  const [verificationUri, setVerificationUri] = React.useState('');
+  const [userCode, setUserCode] = React.useState('');
+  const [error, setError] = React.useState('');
+
+  const tokenValid =
+    config.enkiGateToken &&
+    config.enkiGateExpiresAt &&
+    config.enkiGateExpiresAt > Date.now();
+
+  const startDeviceFlow = async () => {
+    setConnecting(true);
+    setError('');
+    setVerificationUri('');
+    setUserCode('');
+    try {
+      const settings = ServerConnection.makeSettings();
+      const url = `${settings.baseUrl}jupyter-mynerva/enki-gate/device-flows`;
+      const resp = await ServerConnection.makeRequest(
+        url,
+        { method: 'POST', body: JSON.stringify({ enkiGateUrl: enkiUrl }) },
+        settings
+      );
+      if (!resp.ok) {
+        const body = await resp.json();
+        throw new Error(body.error || 'Failed to start device flow');
+      }
+      const data = await resp.json();
+      setVerificationUri(data.verification_uri);
+      setUserCode(data.user_code);
+
+      const interval = (data.interval || 5) * 1000;
+      const pollUrl = `${settings.baseUrl}jupyter-mynerva/enki-gate/device-flows/${encodeURIComponent(data.device_code)}/poll`;
+
+      const poll = async (): Promise<void> => {
+        const pollResp = await ServerConnection.makeRequest(
+          pollUrl,
+          { method: 'POST', body: JSON.stringify({ enkiGateUrl: enkiUrl }) },
+          settings
+        );
+        if (!pollResp.ok) {
+          throw new Error('Polling failed');
+        }
+        const pollData = await pollResp.json();
+        if (pollData.status === 'pending') {
+          await new Promise(r => setTimeout(r, interval));
+          return poll();
+        }
+        if (pollData.status === 'completed') {
+          const newConfig: IConfig = {
+            ...config,
+            provider: 'enki-gate',
+            model: '',
+            apiKey: '',
+            enkiGateUrl: enkiUrl,
+            enkiGateToken: pollData.access_token,
+            enkiGateModel: pollData.selected_model || '',
+            enkiGateExpiresAt: Date.now() + (pollData.expires_in || 3600) * 1000
+          };
+          await saveConfig(newConfig);
+          onSave(newConfig);
+          setVerificationUri('');
+          setUserCode('');
+          return;
+        }
+        throw new Error(`Unexpected status: ${pollData.status}`);
+      };
+
+      await poll();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Device flow failed');
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const remainingMinutes = tokenValid
+    ? Math.ceil(((config.enkiGateExpiresAt ?? 0) - Date.now()) / 60000)
+    : 0;
+
+  return (
+    <>
+      <div className="jp-Mynerva-settings-field">
+        <label>Enki Gate URL</label>
+        <input
+          type="text"
+          value={enkiUrl}
+          onChange={e => setEnkiUrl(e.target.value)}
+          placeholder="https://enki-gate.web.app"
+        />
+      </div>
+      {tokenValid && (
+        <div className="jp-Mynerva-settings-warning">
+          Connected ({config.enkiGateModel}). Token expires in {remainingMinutes}m.
+        </div>
+      )}
+      {connecting && verificationUri && (
+        <div style={{ padding: '12px', background: '#f0f4ff', border: '1px solid #4a86c8', borderRadius: '4px' }}>
+          <a
+            href={verificationUri}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              display: 'block',
+              textAlign: 'center',
+              padding: '10px',
+              marginBottom: '12px',
+              background: '#4a86c8',
+              color: 'white',
+              borderRadius: '4px',
+              textDecoration: 'none',
+              fontWeight: 'bold'
+            }}
+          >
+            Open Enki Gate
+          </a>
+          <CopyableCode code={userCode} />
+        </div>
+      )}
+      {error && <div className="jp-Mynerva-settings-error">{error}</div>}
+      {!connecting && (
+        <button
+          className="jp-Mynerva-settings-save"
+          onClick={startDeviceFlow}
+        >
+          {tokenValid ? 'Reconnect' : 'Connect'}
+        </button>
+      )}
+    </>
+  );
+}
+
 function SettingsView({
   config,
   providers,
@@ -292,7 +467,7 @@ function SettingsView({
     setProvider(newProvider);
     const newProviderData = providers.find(p => p.id === newProvider);
     if (newProviderData && !newProviderData.models.includes(model)) {
-      setModel(newProviderData.models[0]);
+      setModel(newProviderData.models[0] || '');
     }
   };
 
@@ -332,10 +507,10 @@ function SettingsView({
       )}
       {!useDefault && (
         <>
-          {!encryption && !warning && (
+          {!encryption && !warning && provider !== 'enki-gate' && (
             <div className="jp-Mynerva-settings-warning">
               API keys are stored unencrypted. Set MYNERVA_SECRET_KEY for
-              encryption.
+              encryption, or use Enki Gate for short-lived tokens.
             </div>
           )}
           <div className="jp-Mynerva-settings-field">
@@ -351,36 +526,44 @@ function SettingsView({
               ))}
             </select>
           </div>
-          <div className="jp-Mynerva-settings-field">
-            <label>Model</label>
-            <select value={model} onChange={e => setModel(e.target.value)}>
-              {models.map(m => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="jp-Mynerva-settings-field">
-            <label>API Key</label>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              placeholder="Enter API key"
-            />
-          </div>
+          {provider === 'enki-gate' ? (
+            <EnkiGateSettings config={config} onSave={onSave} />
+          ) : (
+            <>
+              <div className="jp-Mynerva-settings-field">
+                <label>Model</label>
+                <select value={model} onChange={e => setModel(e.target.value)}>
+                  {models.map(m => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="jp-Mynerva-settings-field">
+                <label>API Key</label>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  placeholder="Enter API key"
+                />
+              </div>
+            </>
+          )}
         </>
       )}
       {warning && <div className="jp-Mynerva-settings-error">{warning}</div>}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
-      <button
-        className="jp-Mynerva-settings-save"
-        onClick={handleSave}
-        disabled={saving}
-      >
-        {saving ? 'Saving...' : 'Save'}
-      </button>
+      {provider !== 'enki-gate' && (
+        <button
+          className="jp-Mynerva-settings-save"
+          onClick={handleSave}
+          disabled={saving}
+        >
+          {saving ? 'Saving...' : 'Save'}
+        </button>
+      )}
     </div>
   );
 }

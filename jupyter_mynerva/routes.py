@@ -44,6 +44,11 @@ PROVIDERS = [
             'claude-sonnet-4-20250514',
             'claude-opus-4-1-20250805'
         ]
+    },
+    {
+        'id': 'enki-gate',
+        'displayName': 'Enki Gate',
+        'models': []
     }
 ]
 
@@ -276,8 +281,11 @@ class ConfigHandler(APIHandler):
         self.finish(json.dumps({'status': 'ok'}))
 
 
-def chat_openai(api_key, model, messages):
-    client = OpenAI(api_key=api_key)
+def chat_openai(api_key, model, messages, base_url=None):
+    kwargs = {'api_key': api_key}
+    if base_url:
+        kwargs['base_url'] = base_url
+    client = OpenAI(**kwargs)
     response = client.chat.completions.create(model=model, messages=messages)
     return {'provider': 'openai', 'response': response.model_dump()}
 
@@ -335,6 +343,19 @@ class ChatHandler(APIHandler):
             provider = config.get('provider', DEFAULT_PROVIDER)
             model = config.get('model', DEFAULT_MODEL)
             api_key = config.get('apiKey')
+
+        if provider == 'enki-gate':
+            enki_token = config.get('enkiGateToken')
+            enki_url = config.get('enkiGateUrl')
+            enki_model = config.get('enkiGateModel', '')
+            if not enki_token or not enki_url:
+                self.set_status(500)
+                self.finish(json.dumps({'error': 'Enki Gate not configured. Run device flow first.'}))
+                return
+            result = chat_openai(enki_token, enki_model, messages,
+                                 base_url=enki_url.rstrip('/') + '/v1')
+            self.finish(json.dumps(result))
+            return
 
         if not api_key:
             self.set_status(500)
@@ -528,6 +549,51 @@ class NblibramHandler(APIHandler):
             self.finish(json.dumps({'output': result.stdout}))
 
 
+class EnkiGateDeviceFlowHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self):
+        data = self.get_json_body()
+        enki_url = data.get('enkiGateUrl', '').rstrip('/')
+        if not enki_url:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'enkiGateUrl is required'}))
+            return
+
+        import urllib.request
+        req = urllib.request.Request(f'{enki_url}/api/device-flows', method='POST')
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = json.loads(resp.read())
+            self.finish(json.dumps(body))
+        except urllib.error.HTTPError as e:
+            self.set_status(e.code)
+            self.finish(json.dumps({'error': e.read().decode()}))
+
+
+class EnkiGateDeviceFlowPollHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self, device_code):
+        data = self.get_json_body()
+        enki_url = data.get('enkiGateUrl', '').rstrip('/')
+        if not enki_url:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'enkiGateUrl is required'}))
+            return
+
+        import urllib.request
+        req = urllib.request.Request(
+            f'{enki_url}/api/device-flows/{device_code}/poll',
+            method='POST'
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = json.loads(resp.read())
+            self.finish(json.dumps(body))
+        except urllib.error.HTTPError as e:
+            self.set_status(e.code)
+            self.finish(json.dumps({'error': e.read().decode()}))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -538,13 +604,17 @@ def setup_route_handlers(web_app):
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
+    enki_device_flow_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows')
+    enki_device_flow_poll_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows', '([^/]+)', 'poll')
     handlers = [
         (providers_pattern, ProvidersHandler),
         (config_pattern, ConfigHandler),
         (chat_pattern, ChatHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
-        (nblibram_pattern, NblibramHandler)
+        (nblibram_pattern, NblibramHandler),
+        (enki_device_flow_pattern, EnkiGateDeviceFlowHandler),
+        (enki_device_flow_poll_pattern, EnkiGateDeviceFlowPollHandler)
     ]
 
     web_app.add_handlers(host_pattern, handlers)
