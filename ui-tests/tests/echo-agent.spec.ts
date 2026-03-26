@@ -86,7 +86,9 @@ test.describe('Echo Agent', () => {
     await page.getByRole('tab', { name: 'Mynerva' }).click();
     const result = await sendAndApprove(page, 'help', 'help');
     // Echo agent requests help for 'getToc'
-    expect(result).toContain('getToc: Get heading structure of current notebook');
+    expect(result).toContain(
+      'getToc: Get heading structure of current notebook'
+    );
     expect(result).toContain('Required: (none)');
   });
 });
