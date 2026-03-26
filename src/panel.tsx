@@ -281,19 +281,35 @@ function CopyableCode({ code }: { code: string }): React.ReactElement {
 
   return (
     <div style={{ textAlign: 'center' }}>
-      <div style={{ fontSize: '0.85em', color: '#666', marginBottom: '4px' }}>and enter this code</div>
+      <div style={{ fontSize: '0.85em', color: '#666', marginBottom: '4px' }}>
+        and enter this code
+      </div>
       <div
-        style={{ fontSize: '1.8em', fontWeight: 'bold', letterSpacing: '0.1em', color: '#333', cursor: 'pointer' }}
+        style={{
+          fontSize: '1.8em',
+          fontWeight: 'bold',
+          letterSpacing: '0.1em',
+          color: '#333',
+          cursor: 'pointer'
+        }}
         title="Click to copy"
         onClick={handleCopy}
       >
         {code}{' '}
-        <span style={{ verticalAlign: 'middle', marginLeft: '4px', display: 'inline-block' }}>
+        <span
+          style={{
+            verticalAlign: 'middle',
+            marginLeft: '4px',
+            display: 'inline-block'
+          }}
+        >
           <copyIcon.react tag="span" width="16px" height="16px" />
         </span>
       </div>
       {copied && (
-        <div style={{ fontSize: '0.8em', color: '#4a86c8', marginTop: '4px' }}>Copied!</div>
+        <div style={{ fontSize: '0.8em', color: '#4a86c8', marginTop: '4px' }}>
+          Copied!
+        </div>
       )}
     </div>
   );
@@ -402,11 +418,19 @@ function EnkiGateSettings({
       </div>
       {tokenValid && (
         <div className="jp-Mynerva-settings-warning">
-          Connected ({config.enkiGateModel}). Token expires in {remainingMinutes}m.
+          Connected ({config.enkiGateModel}). Token expires in{' '}
+          {remainingMinutes}m.
         </div>
       )}
       {connecting && verificationUri && (
-        <div style={{ padding: '12px', background: '#f0f4ff', border: '1px solid #4a86c8', borderRadius: '4px' }}>
+        <div
+          style={{
+            padding: '12px',
+            background: '#f0f4ff',
+            border: '1px solid #4a86c8',
+            borderRadius: '4px'
+          }}
+        >
           <a
             href={verificationUri}
             target="_blank"
@@ -430,10 +454,7 @@ function EnkiGateSettings({
       )}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
       {!connecting && (
-        <button
-          className="jp-Mynerva-settings-save"
-          onClick={startDeviceFlow}
-        >
+        <button className="jp-Mynerva-settings-save" onClick={startDeviceFlow}>
           {tokenValid ? 'Reconnect' : 'Connect'}
         </button>
       )}
@@ -954,7 +975,6 @@ function MynervaComponent({
   // Queue of action results waiting to be sent
   const [pendingResults, setPendingResults] = React.useState<string[]>([]);
 
-
   // Flag to prevent duplicate execution from useEffect during batch operations
   const executingActionsRef = React.useRef(false);
 
@@ -1029,20 +1049,12 @@ function MynervaComponent({
       }
       case 'getSection': {
         const cells = await liveQuery.getSection(action.query);
-        result = JSON.stringify(
-          { type: 'getSection', result: cells },
-          null,
-          2
-        );
+        result = JSON.stringify({ type: 'getSection', result: cells }, null, 2);
         break;
       }
       case 'getCells': {
         const cells = await liveQuery.getCells(action.query, action.count);
-        result = JSON.stringify(
-          { type: 'getCells', result: cells },
-          null,
-          2
-        );
+        result = JSON.stringify({ type: 'getCells', result: cells }, null, 2);
         break;
       }
       case 'getOutput': {
@@ -1116,7 +1128,10 @@ function MynervaComponent({
         break;
       }
       case 'getOutputFromFile': {
-        const outputs = await nblibramOutputsFromFile(action.path, action.query);
+        const outputs = await nblibramOutputsFromFile(
+          action.path,
+          action.query
+        );
         result = JSON.stringify(
           { type: 'getOutputFromFile', path: action.path, result: outputs },
           null,

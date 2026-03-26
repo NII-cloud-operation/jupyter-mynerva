@@ -44,9 +44,7 @@ function queryToArgs(query: ICellQuery): string[] {
   if ('match' in query) {
     return ['-query', `match:${query.match}`];
   }
-  throw new Error(
-    `Unsupported query for nblibram: ${JSON.stringify(query)}`
-  );
+  throw new Error(`Unsupported query for nblibram: ${JSON.stringify(query)}`);
 }
 
 // --- File-based queries (no live doc needed) ---
@@ -175,10 +173,7 @@ export class NblibramLiveQuery {
     return query;
   }
 
-  private buildRequest(
-    command: string,
-    args: string[]
-  ): INblibramRequest {
+  private buildRequest(command: string, args: string[]): INblibramRequest {
     if (!this.filterEnabled) {
       args = ['-no-filter', ...args];
     }
@@ -191,15 +186,17 @@ export class NblibramLiveQuery {
   }
 
   async getToc(): Promise<unknown> {
-    return callNblibram(
-      this.buildRequest('toc', ['-format', 'json'])
-    );
+    return callNblibram(this.buildRequest('toc', ['-format', 'json']));
   }
 
   async getSection(query: ICellQuery): Promise<unknown> {
     const resolved = this.resolveQuery(query);
     return callNblibram(
-      this.buildRequest('section', ['-format', 'json', ...queryToArgs(resolved)])
+      this.buildRequest('section', [
+        '-format',
+        'json',
+        ...queryToArgs(resolved)
+      ])
     );
   }
 
@@ -215,7 +212,11 @@ export class NblibramLiveQuery {
   async getOutput(query: ICellQuery): Promise<unknown> {
     const resolved = this.resolveQuery(query);
     return callNblibram(
-      this.buildRequest('outputs', ['-format', 'json', ...queryToArgs(resolved)])
+      this.buildRequest('outputs', [
+        '-format',
+        'json',
+        ...queryToArgs(resolved)
+      ])
     );
   }
 }
