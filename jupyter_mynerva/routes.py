@@ -13,6 +13,8 @@ from pathlib import Path
 
 import cachetools
 
+_log = logging.getLogger(__name__)
+
 try:
     import tomllib
 except ImportError:
@@ -24,6 +26,8 @@ import tornado
 from openai import OpenAI
 from anthropic import Anthropic
 from cryptography.fernet import Fernet
+
+from .echo_agent import chat_echo
 
 
 PROVIDERS = [
@@ -56,6 +60,9 @@ PROVIDERS = [
         'models': []
     }
 ]
+
+if os.environ.get('MYNERVA_ECHO_AGENT'):
+    PROVIDERS.append({'id': 'echo', 'displayName': 'Echo (Testing)', 'models': []})
 
 DEFAULT_PROVIDER = 'openai'
 DEFAULT_MODEL = 'gpt-5.2'
@@ -348,6 +355,11 @@ class ChatHandler(APIHandler):
             provider = config.get('provider', DEFAULT_PROVIDER)
             model = config.get('model', DEFAULT_MODEL)
             api_key = config.get('apiKey')
+
+        if provider == 'echo':
+            result = chat_echo(messages)
+            self.finish(json.dumps(result))
+            return
 
         if provider == 'enki-gate':
             enki_token = config.get('enkiGateToken')

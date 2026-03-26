@@ -12,8 +12,7 @@ test.describe('NblibramHandler', () => {
 
   test('toc returns headings', async ({ page, tmpPath }) => {
     const response = await page.evaluate(async (path: string) => {
-      const settings = (window as any).jupyterapp.serviceManager
-        .serverSettings;
+      const settings = (window as any).jupyterapp.serviceManager.serverSettings;
       const res = await fetch(`${settings.baseUrl}jupyter-mynerva/nblibram`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -36,8 +35,7 @@ test.describe('NblibramHandler', () => {
 
   test('cells returns matched cells', async ({ page, tmpPath }) => {
     const response = await page.evaluate(async (path: string) => {
-      const settings = (window as any).jupyterapp.serviceManager
-        .serverSettings;
+      const settings = (window as any).jupyterapp.serviceManager.serverSettings;
       const res = await fetch(`${settings.baseUrl}jupyter-mynerva/nblibram`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -61,8 +59,7 @@ test.describe('NblibramHandler', () => {
 
   test('invalid command returns 400', async ({ page }) => {
     const response = await page.evaluate(async () => {
-      const settings = (window as any).jupyterapp.serviceManager
-        .serverSettings;
+      const settings = (window as any).jupyterapp.serviceManager.serverSettings;
       const res = await fetch(`${settings.baseUrl}jupyter-mynerva/nblibram`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

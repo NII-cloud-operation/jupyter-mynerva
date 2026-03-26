@@ -158,8 +158,7 @@ export class NblibramLiveQuery {
 
   private resolveQuery(query: ICellQuery): ICellQuery {
     if ('active' in query) {
-      const index =
-        this.notebookTracker.currentWidget?.content.activeCellIndex;
+      const index = this.notebookTracker.currentWidget?.content.activeCellIndex;
       if (index === undefined || index < 0) {
         throw new Error('No active cell');
       }
