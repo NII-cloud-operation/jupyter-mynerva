@@ -520,7 +520,24 @@ def _get_store_path(notebook_path):
     return _notebook_stores[notebook_path]
 
 
+_NBLIBRAM_COMMANDS = frozenset(['toc', 'section', 'cells', 'outputs'])
+_NBLIBRAM_FORMATS = frozenset(['md', 'json', 'py', 'text', 'raw'])
+
+
 class NblibramHandler(APIHandler):
+
+    def _validate_path(self, path):
+        """Resolve path against content root. Rejects traversal and hidden files."""
+        root_dir = os.path.realpath(self.contents_manager.root_dir)
+        resolved = os.path.realpath(os.path.join(root_dir, path))
+        if not resolved.startswith(root_dir + os.sep):
+            raise ValueError('path escapes content root')
+        rel = os.path.relpath(resolved, root_dir)
+        for part in rel.split(os.sep):
+            if part.startswith('.'):
+                raise ValueError('hidden files are not accessible')
+        return resolved
+
     @tornado.web.authenticated
     def post(self):
         nblibram_path = shutil.which('nblibram')
@@ -531,23 +548,62 @@ class NblibramHandler(APIHandler):
 
         data = self.get_json_body()
         command = data.get('command', '')
-        args = data.get('args', [])
-        notebook_path = data.get('notebookPath')
+        if command not in _NBLIBRAM_COMMANDS:
+            self.set_status(400)
+            self.finish(json.dumps({'error': f'unknown command: {command}'}))
+            return
+
+        # Resolve file path
+        path = data.get('path', '')
         notebook_content = data.get('notebookContent')
-        # Update store if content provided (dirty sync)
-        if notebook_path and notebook_content is not None:
-            store_path = _get_store_path(notebook_path)
+
+        if notebook_content is not None:
+            # Dirty sync: write content to temp store
+            store_key = os.path.normpath(path)
+            store_path = _get_store_path(store_key)
             with open(store_path, 'w') as f:
                 json.dump(notebook_content, f)
-
-        # If command targets the live notebook, use the store file
-        if notebook_path and '-file' not in args:
-            store_path = _get_store_path(notebook_path)
-            if not os.path.exists(store_path):
+            file_arg = store_path
+        elif path:
+            try:
+                file_arg = self._validate_path(path)
+            except ValueError as e:
                 self.set_status(400)
-                self.finish(json.dumps({'error': 'No notebook content in store. Send notebookContent first.'}))
+                self.finish(json.dumps({'error': str(e)}))
                 return
-            args = ['-file', store_path] + args
+        else:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'path is required'}))
+            return
+
+        # Build CLI args from structured params
+        args = ['-file', file_arg]
+
+        fmt = data.get('format')
+        if fmt:
+            if fmt not in _NBLIBRAM_FORMATS:
+                self.set_status(400)
+                self.finish(json.dumps({'error': f'unknown format: {fmt}'}))
+                return
+            args += ['-format', fmt]
+
+        query = data.get('query')
+        if query:
+            if not isinstance(query, str):
+                self.set_status(400)
+                self.finish(json.dumps({'error': 'query must be a string'}))
+                return
+            args += ['-query', query]
+
+        count = data.get('count')
+        if count is not None:
+            args += ['-count', str(int(count))]
+
+        if data.get('noFilter'):
+            args.append('-no-filter')
+
+        if data.get('excludeOutputs'):
+            args.append('-exclude-outputs')
 
         cmd = [nblibram_path, command] + args
         result = subprocess.run(cmd, capture_output=True, text=True)

@@ -5,9 +5,13 @@ import { ICellQuery } from './context';
 
 interface INblibramRequest {
   command: string;
-  args: string[];
-  notebookPath?: string;
+  path: string;
   notebookContent?: unknown;
+  format?: string;
+  query?: string;
+  count?: number;
+  noFilter?: boolean;
+  excludeOutputs?: boolean;
 }
 
 async function callNblibram(req: INblibramRequest): Promise<unknown> {
@@ -31,18 +35,18 @@ async function callNblibram(req: INblibramRequest): Promise<unknown> {
   return response.json();
 }
 
-function queryToArgs(query: ICellQuery): string[] {
+function queryToString(query: ICellQuery): string {
   if ('start' in query) {
-    return ['-query', `start:${query.start}`];
+    return `start:${query.start}`;
   }
   if ('id' in query) {
-    return ['-query', `id:${query.id}`];
+    return `id:${query.id}`;
   }
   if ('contains' in query) {
-    return ['-query', `contains:${query.contains}`];
+    return `contains:${query.contains}`;
   }
   if ('match' in query) {
-    return ['-query', `match:${query.match}`];
+    return `match:${query.match}`;
   }
   throw new Error(`Unsupported query for nblibram: ${JSON.stringify(query)}`);
 }
@@ -50,10 +54,7 @@ function queryToArgs(query: ICellQuery): string[] {
 // --- File-based queries (no live doc needed) ---
 
 export async function nblibramTocFromFile(path: string): Promise<unknown> {
-  return callNblibram({
-    command: 'toc',
-    args: ['-file', path, '-format', 'json']
-  });
+  return callNblibram({ command: 'toc', path, format: 'json' });
 }
 
 export async function nblibramSectionFromFile(
@@ -62,7 +63,9 @@ export async function nblibramSectionFromFile(
 ): Promise<unknown> {
   return callNblibram({
     command: 'section',
-    args: ['-file', path, '-format', 'json', ...queryToArgs(query)]
+    path,
+    format: 'json',
+    query: queryToString(query)
   });
 }
 
@@ -71,11 +74,13 @@ export async function nblibramCellsFromFile(
   query: ICellQuery,
   count?: number
 ): Promise<unknown> {
-  const args = ['-file', path, '-format', 'json', ...queryToArgs(query)];
-  if (count) {
-    args.push('-count', String(count));
-  }
-  return callNblibram({ command: 'cells', args });
+  return callNblibram({
+    command: 'cells',
+    path,
+    format: 'json',
+    query: queryToString(query),
+    count
+  });
 }
 
 export async function nblibramOutputsFromFile(
@@ -84,7 +89,9 @@ export async function nblibramOutputsFromFile(
 ): Promise<unknown> {
   return callNblibram({
     command: 'outputs',
-    args: ['-file', path, '-format', 'json', ...queryToArgs(query)]
+    path,
+    format: 'json',
+    query: queryToString(query)
   });
 }
 
@@ -151,7 +158,8 @@ export class NblibramLiveQuery {
 
   private resolveQuery(query: ICellQuery): ICellQuery {
     if ('active' in query) {
-      const index = this.notebookTracker.currentWidget?.content.activeCellIndex;
+      const index =
+        this.notebookTracker.currentWidget?.content.activeCellIndex;
       if (index === undefined || index < 0) {
         throw new Error('No active cell');
       }
@@ -173,50 +181,48 @@ export class NblibramLiveQuery {
     return query;
   }
 
-  private buildRequest(command: string, args: string[]): INblibramRequest {
-    if (!this.filterEnabled) {
-      args = ['-no-filter', ...args];
-    }
-    return {
+  private buildRequest(
+    command: string,
+    query?: string,
+    opts?: { count?: number }
+  ): INblibramRequest {
+    const req: INblibramRequest = {
       command,
-      args,
-      notebookPath: this.getNotebookPath(),
-      notebookContent: this.getNotebookContent()
+      path: this.getNotebookPath(),
+      format: 'json',
+      noFilter: !this.filterEnabled || undefined
     };
+    const content = this.getNotebookContent();
+    if (content !== undefined) {
+      req.notebookContent = content;
+    }
+    if (query) {
+      req.query = query;
+    }
+    if (opts?.count) {
+      req.count = opts.count;
+    }
+    return req;
   }
 
   async getToc(): Promise<unknown> {
-    return callNblibram(this.buildRequest('toc', ['-format', 'json']));
+    return callNblibram(this.buildRequest('toc'));
   }
 
   async getSection(query: ICellQuery): Promise<unknown> {
     const resolved = this.resolveQuery(query);
-    return callNblibram(
-      this.buildRequest('section', [
-        '-format',
-        'json',
-        ...queryToArgs(resolved)
-      ])
-    );
+    return callNblibram(this.buildRequest('section', queryToString(resolved)));
   }
 
   async getCells(query: ICellQuery, count?: number): Promise<unknown> {
     const resolved = this.resolveQuery(query);
-    const args = ['-format', 'json', ...queryToArgs(resolved)];
-    if (count) {
-      args.push('-count', String(count));
-    }
-    return callNblibram(this.buildRequest('cells', args));
+    return callNblibram(
+      this.buildRequest('cells', queryToString(resolved), { count })
+    );
   }
 
   async getOutput(query: ICellQuery): Promise<unknown> {
     const resolved = this.resolveQuery(query);
-    return callNblibram(
-      this.buildRequest('outputs', [
-        '-format',
-        'json',
-        ...queryToArgs(resolved)
-      ])
-    );
+    return callNblibram(this.buildRequest('outputs', queryToString(resolved)));
   }
 }
