@@ -104,6 +104,7 @@ test.describe('NblibramHandler', () => {
           body: JSON.stringify({
             command: 'toc',
             path: path,
+            live: true,
             format: 'json',
             notebookContent: content
           })
@@ -145,6 +146,7 @@ test.describe('NblibramHandler', () => {
           body: JSON.stringify({
             command: 'cells',
             path: path,
+            live: true,
             format: 'json',
             query: 'start:0',
             count: 1,

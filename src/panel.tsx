@@ -876,7 +876,7 @@ function ChatView({
               checked={filterEnabled}
               onChange={e => onFilterToggle(e.target.checked)}
             />
-            Privacy filter (.nbfilterrc.toml)
+            Privacy filter
           </label>
           {loading ? (
             <button className="jp-Mynerva-cancel" onClick={onCancelLoading}>

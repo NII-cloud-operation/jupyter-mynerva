@@ -567,16 +567,23 @@ class NblibramHandler(APIHandler):
 
         # Resolve file path
         path = data.get('path', '')
+        live = data.get('live', False)
         notebook_content = data.get('notebookContent')
 
-        if notebook_content is not None:
-            # Dirty sync: write content to temp store
+        if live:
+            # Live notebook query: use temp store
             store_key = os.path.normpath(path)
-            store_path = _get_store_path(store_key)
-            with open(store_path, 'w') as f:
-                json.dump(notebook_content, f)
-            file_arg = store_path
+            if notebook_content is not None:
+                store_path = _get_store_path(store_key)
+                with open(store_path, 'w') as f:
+                    json.dump(notebook_content, f)
+            if store_key not in _notebook_stores:
+                self.set_status(400)
+                self.finish(json.dumps({'error': 'No notebook content in store. Send notebookContent first.'}))
+                return
+            file_arg = _notebook_stores[store_key]
         elif path:
+            # File-based query: read from disk
             try:
                 file_arg = self._validate_path(path)
             except ValueError as e:

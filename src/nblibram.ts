@@ -6,6 +6,7 @@ import { ICellQuery } from './context';
 interface INblibramRequest {
   command: string;
   path: string;
+  live?: boolean;
   notebookContent?: unknown;
   format?: string;
   query?: string;
@@ -188,6 +189,7 @@ export class NblibramLiveQuery {
     const req: INblibramRequest = {
       command,
       path: this.getNotebookPath(),
+      live: true,
       format: 'json',
       noFilter: !this.filterEnabled || undefined
     };
