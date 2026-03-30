@@ -1079,7 +1079,7 @@ function MynervaComponent({
       }
       case 'listHelp': {
         result = JSON.stringify(
-          { type: 'listHelp', result: buildSystemPrompt() },
+          { type: 'listHelp', result: buildSystemPrompt(agentMode) },
           null,
           2
         );
@@ -1473,7 +1473,7 @@ function MynervaComponent({
       setMessages(newMessages);
 
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        { role: 'system' as const, content: buildSystemPrompt(agentMode) },
         ...newMessages
       ];
 
@@ -1567,7 +1567,7 @@ function MynervaComponent({
         setMessages(newMessages);
 
         const chatMessages = [
-          { role: 'system' as const, content: buildSystemPrompt() },
+          { role: 'system' as const, content: buildSystemPrompt(agentMode) },
           ...newMessages
         ];
 
@@ -1610,7 +1610,7 @@ function MynervaComponent({
       setMessages(newMessages);
 
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        { role: 'system' as const, content: buildSystemPrompt(agentMode) },
         ...newMessages
       ];
 
@@ -1667,7 +1667,7 @@ function MynervaComponent({
 
     try {
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        { role: 'system' as const, content: buildSystemPrompt(agentMode) },
         ...newMessages
       ];
       const response = await sendChat(chatMessages, controller.signal);

@@ -133,8 +133,15 @@ export function getActionHelp(actionName: string): string {
   return lines.join('\n');
 }
 
-export function buildSystemPrompt(): string {
-  return `You are Mynerva, a Jupyter notebook assistant.
+export function buildSystemPrompt(agentMode = false): string {
+  const envNote = agentMode
+    ? `\n\nEnvironment: AGENT MODE (isolated container)
+- runCell is enabled in this environment.
+- Network is restricted: DNS and HTTPS are allowed, SSH only to pre-approved hosts.
+- SSH keys in this environment are agent-specific (not the user's own keys).`
+    : '';
+
+  return `You are Mynerva, a Jupyter notebook assistant.${envNote}
 - Always respond with JSON only. No text before or after.
 - JSON structure:
   {
