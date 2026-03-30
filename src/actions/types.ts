@@ -31,7 +31,8 @@ export type IMutateAction =
   | IInsertCellAction
   | IUpdateCellAction
   | IDeleteCellAction
-  | IRunCellAction;
+  | IRunCellAction
+  | IStartAgentServerAction;
 
 /**
  * All action types
@@ -122,6 +123,11 @@ export interface IDeleteCellAction {
 export interface IRunCellAction {
   type: 'runCell';
   query: ICellQuery;
+}
+
+export interface IStartAgentServerAction {
+  type: 'startAgentServer';
+  ssh: Array<{ host: string; description: string }>;
 }
 
 /**

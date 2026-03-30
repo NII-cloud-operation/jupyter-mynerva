@@ -20,6 +20,12 @@ function getActionLabel(action: IMutateAction): string {
       return `Delete cell: ${JSON.stringify(action.query)}`;
     case 'runCell':
       return `Run cell: ${JSON.stringify(action.query)}`;
+    case 'startAgentServer': {
+      const hosts = action.ssh
+        .map(s => `${s.host} (${s.description})`)
+        .join(', ');
+      return `Start agent server — SSH: ${hosts}`;
+    }
     default:
       return 'Unknown Action';
   }

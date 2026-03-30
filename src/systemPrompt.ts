@@ -87,10 +87,16 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     usesQuery: true
   },
   runCell: {
-    description: 'Execute cell',
+    description: 'Execute cell (only available in agent environment)',
     required: ['query'],
     optional: [],
     usesQuery: true
+  },
+  startAgentServer: {
+    description: 'Start isolated agent environment with network control',
+    required: ['ssh'],
+    optional: [],
+    usesQuery: false
   },
   listHelp: {
     description: 'Show the system prompt again',
@@ -157,7 +163,8 @@ Mutate (active notebook):
   - insertCell: { "position": {...} or "end", "cellType": "code"|"markdown", "source": "..." } - Insert new cell
   - updateCell: { "query": {...}, "source": "...", "_hash": "..." } - Update cell content (requires _hash from prior read)
   - deleteCell: { "query": {...}, "_hash": "..." } - Delete cell (requires _hash from prior read)
-  - runCell: { "query": {...} } - Execute cell
+  - runCell: { "query": {...} } - Execute cell (agent environment only)
+  - startAgentServer: { "ssh": [{"host": "...", "description": "..."}] } - Start isolated agent environment with SSH access to specified hosts
 
 Query syntax:
   { "match": "regex" } - regex against heading/content

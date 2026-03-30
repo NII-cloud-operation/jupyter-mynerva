@@ -63,6 +63,7 @@ interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
+  agentMode: boolean;
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -606,7 +607,8 @@ const MUTATE_ACTION_TYPES = [
   'insertCell',
   'updateCell',
   'deleteCell',
-  'runCell'
+  'runCell',
+  'startAgentServer'
 ];
 
 // Query hierarchy: higher level permits lower levels
@@ -627,7 +629,12 @@ function isMutateAction(action: IAction): action is IMutateAction {
 }
 
 type QueryActionType = 'getToc' | 'getSection' | 'getCells' | 'getOutput';
-type MutateActionType = 'insertCell' | 'updateCell' | 'deleteCell' | 'runCell';
+type MutateActionType =
+  | 'insertCell'
+  | 'updateCell'
+  | 'deleteCell'
+  | 'runCell'
+  | 'startAgentServer';
 type ActionType = QueryActionType | MutateActionType;
 
 function isQueryAutoApproved(
@@ -935,6 +942,7 @@ function MynervaComponent({
   >([]);
   const [sessionError, setSessionError] = React.useState<string | null>(null);
   const [showSessions, setShowSessions] = React.useState(false);
+  const [agentMode, setAgentMode] = React.useState(false);
 
   // AbortController for cancelling chat requests
   const abortControllerRef = React.useRef<AbortController | null>(null);
@@ -945,6 +953,7 @@ function MynervaComponent({
         setProviders(providersRes.providers);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
+        setAgentMode(providersRes.agentMode ?? false);
         setConfig(cfg);
         setSessions(sessionsRes.sessions);
         setSessionLoadErrors(sessionsRes.errors);
@@ -1175,8 +1184,33 @@ function MynervaComponent({
         return JSON.stringify({ type: 'deleteCell', result }, null, 2);
       }
       case 'runCell': {
+        if (!agentMode) {
+          return JSON.stringify(
+            {
+              type: 'runCell',
+              error:
+                'Cell execution requires an agent environment. Use startAgentServer first.'
+            },
+            null,
+            2
+          );
+        }
         const result = await contextEngine.runCell(action.query);
         return JSON.stringify({ type: 'runCell', result }, null, 2);
+      }
+      case 'startAgentServer': {
+        const settings = ServerConnection.makeSettings();
+        const url = `${settings.baseUrl}jupyter-mynerva/agent-server`;
+        const resp = await ServerConnection.makeRequest(
+          url,
+          {
+            method: 'POST',
+            body: JSON.stringify({ ssh: action.ssh })
+          },
+          settings
+        );
+        const result = await resp.json();
+        return JSON.stringify({ type: 'startAgentServer', result }, null, 2);
       }
       default:
         return JSON.stringify(
