@@ -656,9 +656,10 @@ class AgentServerHandler(APIHandler):
         if data:
             req.add_header('Content-Type', 'application/json')
         with urllib.request.urlopen(req) as resp:
-            if resp.status == 204:
+            body = resp.read()
+            if not body:
                 return None
-            return json.loads(resp.read())
+            return json.loads(body)
 
     @tornado.web.authenticated
     async def post(self):
