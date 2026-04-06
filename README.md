@@ -142,12 +142,12 @@ Query actions show a preview before sending to LLM. Users can choose to apply pr
 
 ### Mutate: Active Notebook
 
-| Action       | Parameters                        | Description                     |
-| ------------ | --------------------------------- | ------------------------------- |
-| `insertCell` | `position`, `cellType`, `source`  | Insert new cell                 |
-| `updateCell` | `query`, `source`, `_hash`        | Update cell content             |
-| `deleteCell` | `query`, `_hash`                  | Delete cell                     |
-| `runCell`    | `query`                           | Execute cell                    |
+| Action       | Parameters                       | Description         |
+| ------------ | -------------------------------- | ------------------- |
+| `insertCell` | `position`, `cellType`, `source` | Insert new cell     |
+| `updateCell` | `query`, `source`, `_hash`       | Update cell content |
+| `deleteCell` | `query`, `_hash`                 | Delete cell         |
+| `runCell`    | `query`                          | Execute cell        |
 
 ### Help (no confirmation required)
 
