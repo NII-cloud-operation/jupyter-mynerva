@@ -4,8 +4,8 @@
   <img src="images/logo.png" alt="Mynerva Logo" width="400">
 </p>
 
-[![Github Actions Status](https://github.com/yacchin1205/jupyter-mynerva/workflows/Build/badge.svg)](https://github.com/yacchin1205/jupyter-mynerva/actions/workflows/build.yml)
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/yacchin1205/jupyter-mynerva/main?urlpath=lab)
+[![Github Actions Status](https://github.com/NII-cloud-operation/jupyter-mynerva/workflows/Build/badge.svg)](https://github.com/NII-cloud-operation/jupyter-mynerva/actions/workflows/build.yml)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/NII-cloud-operation/jupyter-mynerva/main?urlpath=lab)
 
 A JupyterLab extension that provides an LLM-powered assistant with deep understanding of notebook structure.
 
@@ -46,30 +46,40 @@ The LLM actively explores—requesting the table of contents, navigating section
 │                                        │                │
 │  ┌─────────────────────────────────────▼─────────────┐  │
 │  │  Context Engine (TypeScript)                      │  │
-│  │  - ToC / Section / Cell / Output extraction       │  │
 │  │  - Notebook mutation handlers                     │  │
+│  │  - nblibram client (query delegation)             │  │
 │  └─────────────────────────────────────┬─────────────┘  │
 └────────────────────────────────────────┼────────────────┘
                                          │ REST
 ┌────────────────────────────────────────▼────────────────┐
 │  Server Extension (Python)                              │
-│  - LLM proxy (OpenAI / Anthropic)                       │
+│  - LLM proxy (OpenAI / Anthropic / Enki Gate)           │
+│  - nblibram CLI proxy (query execution)                 │
 │  - Session storage (.mynerva files)                     │
+│  - Enki Gate device flow authentication                 │
+└─────────────────┬───────────────────────────────────────┘
+                  │ subprocess
+┌─────────────────▼───────────────────────────────────────┐
+│  nblibram (Go binary)                                   │
+│  - ToC / Section / Cell / Output extraction             │
+│  - Privacy filter (gitleaks-based)                      │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **Mynerva Panel**: Chat interface in the right sidebar. Operates on the currently open notebook.
 
-**Context Engine**: Extracts notebook structure—ToC from headings, sections as markdown+code units, outputs with type awareness. TypeScript implementation (port of nbq logic).
+**Context Engine**: Handles notebook mutations (insert, update, delete cells) and delegates read queries (ToC, sections, cells, outputs) to nblibram via the server extension.
 
-**Server Extension**: Proxies LLM API (no streaming). Sessions persisted in `.mynerva/` directory.
+**Server Extension**: Proxies LLM API (no streaming), invokes nblibram CLI for notebook queries, and handles Enki Gate device flow authentication. Sessions persisted in `.mynerva/` directory.
+
+**nblibram**: External Go binary that extracts notebook structure—ToC from headings, sections as markdown+code units, outputs with type awareness. Also applies privacy filters based on gitleaks rules (configured via `NBLIBRAM_GITLEAKS_CONFIG` environment variable).
 
 ### Design Decisions
 
 | Topic               | Decision                                                                                           |
 | ------------------- | -------------------------------------------------------------------------------------------------- |
-| Context extraction  | TypeScript reimplementation of nbq                                                                 |
-| Privacy filter      | TypeScript, reads `.nbfilterrc.toml` for consistency with nbfilter                                 |
+| Context extraction  | Delegated to nblibram CLI (Go binary, unifies nbq + nbfilter)                                      |
+| Privacy filter      | Handled by nblibram, gitleaks-based rules (`NBLIBRAM_GITLEAKS_CONFIG` env)                         |
 | Session storage     | `.mynerva/sessions/*.mnchat` files, auto-named (timestamp + ID)                                    |
 | Session lifecycle   | Independent of active notebook; explicit switch only                                               |
 | Streaming           | Not supported                                                                                      |
@@ -77,7 +87,7 @@ The LLM actively explores—requesting the table of contents, navigating section
 | Action confirmation | Batch confirmation supported; per-notebook auto-approval available                                 |
 | Mutation validation | Optimistic locking via `_hash`; must read before write                                             |
 | Error handling      | API failure: retry with limit (3). Hash mismatch / user rejection: feedback to LLM, no retry count |
-| LLM providers       | OpenAI, Anthropic                                                                                  |
+| LLM providers       | OpenAI, Anthropic, Enki Gate (device flow auth)                                                    |
 
 ### UI
 
@@ -94,6 +104,7 @@ The LLM actively explores—requesting the table of contents, navigating section
 - Provider selection
 - Model selection
 - API key (Fernet-encrypted if secret key present)
+- Enki Gate connection (device flow authentication)
 
 ## Actions
 
@@ -131,12 +142,12 @@ Query actions show a preview before sending to LLM. Users can choose to apply pr
 
 ### Mutate: Active Notebook
 
-| Action        | Parameters                        | Description                     |
-| ------------- | --------------------------------- | ------------------------------- |
-| `insertCell`  | `position`, `cellType`, `content` | Insert above/below current cell |
-| `replaceCell` | `query`, `content`                | Replace cell content            |
-| `deleteCell`  | `query`                           | Delete cell                     |
-| `runCell`     | `query?`                          | Execute cell (default: current) |
+| Action       | Parameters                        | Description                     |
+| ------------ | --------------------------------- | ------------------------------- |
+| `insertCell` | `position`, `cellType`, `source`  | Insert new cell                 |
+| `updateCell` | `query`, `source`, `_hash`        | Update cell content             |
+| `deleteCell` | `query`, `_hash`                  | Delete cell                     |
+| `runCell`    | `query`                           | Execute cell                    |
 
 ### Help (no confirmation required)
 
@@ -240,6 +251,18 @@ Administrators can provide default LLM settings via environment variables. Users
 
 **Security note:** API key environment variables are deleted after loading to prevent exposure in notebook cells.
 
+### Enki Gate
+
+[Enki Gate](https://github.com/yacchin1205/enki-gate) is an LLM gateway that provides shared access to AI models. To connect:
+
+1. Select "Enki Gate" as the provider in Settings
+2. Enter the Enki Gate URL (e.g. `https://enki-gate.web.app`)
+3. Click "Connect" to start the device flow
+4. Open the verification URL in your browser and enter the displayed code
+5. Once authorized, the token is saved automatically
+
+The token has an expiration time; the UI will prompt re-authentication when needed.
+
 ### User Configuration
 
 Users can configure their own settings via the panel settings UI:
@@ -247,17 +270,29 @@ Users can configure their own settings via the panel settings UI:
 - Provider selection
 - Model selection
 - API key (encrypted if `MYNERVA_SECRET_KEY` is set)
+- Enki Gate connection (device flow)
 
 If default configuration is available, users can choose "Use default settings" instead of providing their own API key.
 
 ## Requirements
 
 - JupyterLab >= 4.0.0
+- [nblibram](https://github.com/NII-cloud-operation/nblibram) binary in `PATH`
 
 ## Install
 
 ```bash
 pip install jupyter_mynerva
+```
+
+Install the nblibram binary (notebook query engine):
+
+```bash
+# Linux (amd64)
+wget -qO- https://github.com/NII-cloud-operation/nblibram/releases/latest/download/nblibram_linux_amd64.tar.gz | tar xz -C /usr/local/bin/ nblibram
+
+# macOS (Apple Silicon)
+wget -qO- https://github.com/NII-cloud-operation/nblibram/releases/latest/download/nblibram_darwin_arm64.tar.gz | tar xz -C /usr/local/bin/ nblibram
 ```
 
 ## Contributing
@@ -323,5 +358,5 @@ See [RELEASE](RELEASE.md)
 
 ## References
 
-- [nbq](https://github.com/yacchin1205/nbq) - CLI for querying notebook structure (ToC, sections, cells, outputs)
-- [nbfilter](https://github.com/yacchin1205/nbfilter) - Privacy filter for notebooks (masks IPs, domains, etc.)
+- [nblibram](https://github.com/NII-cloud-operation/nblibram) - Notebook query and privacy filter CLI (integrates nbq + nbfilter)
+- [Enki Gate](https://github.com/yacchin1205/enki-gate) - LLM gateway with device flow authentication
