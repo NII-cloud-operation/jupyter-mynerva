@@ -7,9 +7,9 @@
         "jupyterlab",
         "jupyterlab-extension"
     ],
-    "homepage": "https://github.com/yacchin1205/jupyter-mynerva",
+    "homepage": "https://github.com/NII-cloud-operation/jupyter-mynerva",
     "bugs": {
-        "url": "https://github.com/yacchin1205/jupyter-mynerva/issues"
+        "url": "https://github.com/NII-cloud-operation/jupyter-mynerva/issues"
     },
     "license": "BSD-3-Clause",
     "author": "yacchin1205",
@@ -24,7 +24,7 @@
     "style": "style/index.css",
     "repository": {
         "type": "git",
-        "url": "https://github.com/yacchin1205/jupyter-mynerva.git"
+        "url": "https://github.com/NII-cloud-operation/jupyter-mynerva.git"
     },
     "scripts": {
         "build": "jlpm build:lib && jlpm build:labextension:dev",
