@@ -27,6 +27,7 @@ dependencies = [
     "openai>=1.0.0",
     "anthropic>=0.30.0",
     "cryptography>=41.0.0",
+    "cachetools>=5.0.0",
     "tomli>=2.0.0; python_version < '3.11'"
 ]
 dynamic = ["version", "description", "authors", "urls", "keywords"]
@@ -78,6 +79,9 @@ before-build-npm = [
     "jlpm build:prod"
 ]
 before-build-python = ["jlpm clean:all"]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
 
 [tool.check-wheel-contents]
 ignore = ["W002"]

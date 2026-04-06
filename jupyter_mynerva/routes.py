@@ -1,9 +1,19 @@
 import json
+import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+import cachetools
+
+_log = logging.getLogger(__name__)
 
 try:
     import tomllib
@@ -16,6 +26,8 @@ import tornado
 from openai import OpenAI
 from anthropic import Anthropic
 from cryptography.fernet import Fernet
+
+from .echo_agent import chat_echo
 
 
 PROVIDERS = [
@@ -41,8 +53,16 @@ PROVIDERS = [
             'claude-sonnet-4-20250514',
             'claude-opus-4-1-20250805'
         ]
+    },
+    {
+        'id': 'enki-gate',
+        'displayName': 'Enki Gate',
+        'models': []
     }
 ]
+
+if os.environ.get('MYNERVA_ECHO_AGENT'):
+    PROVIDERS.append({'id': 'echo', 'displayName': 'Echo (Testing)', 'models': []})
 
 DEFAULT_PROVIDER = 'openai'
 DEFAULT_MODEL = 'gpt-5.2'
@@ -206,7 +226,11 @@ def load_config():
     if config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
-        config['apiKey'] = decrypt_api_key(config.get('apiKey', ''))
+        try:
+            config['apiKey'] = decrypt_api_key(config.get('apiKey', ''))
+        except ValueError:
+            config['apiKey'] = ''
+            config['decryptError'] = 'MYNERVA_SECRET_KEY is required to decrypt stored API key'
         return config
 
     # Config doesn't exist - check if defaults are available
@@ -269,8 +293,11 @@ class ConfigHandler(APIHandler):
         self.finish(json.dumps({'status': 'ok'}))
 
 
-def chat_openai(api_key, model, messages):
-    client = OpenAI(api_key=api_key)
+def chat_openai(api_key, model, messages, base_url=None):
+    kwargs = {'api_key': api_key}
+    if base_url:
+        kwargs['base_url'] = base_url
+    client = OpenAI(**kwargs)
     response = client.chat.completions.create(model=model, messages=messages)
     return {'provider': 'openai', 'response': response.model_dump()}
 
@@ -328,6 +355,24 @@ class ChatHandler(APIHandler):
             provider = config.get('provider', DEFAULT_PROVIDER)
             model = config.get('model', DEFAULT_MODEL)
             api_key = config.get('apiKey')
+
+        if provider == 'echo':
+            result = chat_echo(messages)
+            self.finish(json.dumps(result))
+            return
+
+        if provider == 'enki-gate':
+            enki_token = config.get('enkiGateToken')
+            enki_url = config.get('enkiGateUrl')
+            enki_model = config.get('enkiGateModel', '')
+            if not enki_token or not enki_url:
+                self.set_status(500)
+                self.finish(json.dumps({'error': 'Enki Gate not configured. Run device flow first.'}))
+                return
+            result = chat_openai(enki_token, enki_model, messages,
+                                 base_url=enki_url.rstrip('/') + '/v1')
+            self.finish(json.dumps(result))
+            return
 
         if not api_key:
             self.set_status(500)
@@ -461,6 +506,184 @@ class SessionHandler(APIHandler):
             self.finish(json.dumps({'error': 'Session not found'}))
 
 
+# Per-notebook store for live document content.
+# LRU eviction cleans up temp files when capacity is exceeded.
+class _NotebookStore(cachetools.LRUCache):
+    def __init__(self, maxsize=16):
+        super().__init__(maxsize=maxsize)
+        self._log = logging.getLogger(__name__)
+
+    def __delitem__(self, key):
+        path = self[key]
+        super().__delitem__(key)
+        try:
+            os.unlink(path)
+        except OSError as e:
+            self._log.warning("Failed to remove store file %s: %s", path, e)
+
+_notebook_stores = _NotebookStore()
+
+
+def _get_store_path(notebook_path):
+    if notebook_path not in _notebook_stores:
+        fd, path = tempfile.mkstemp(suffix='.ipynb', prefix='nblibram-')
+        os.close(fd)
+        _notebook_stores[notebook_path] = path
+    return _notebook_stores[notebook_path]
+
+
+_NBLIBRAM_COMMANDS = frozenset(['toc', 'section', 'cells', 'outputs'])
+_NBLIBRAM_FORMATS = frozenset(['md', 'json', 'py', 'text', 'raw'])
+
+
+class NblibramHandler(APIHandler):
+
+    def _validate_path(self, path):
+        """Resolve path against content root. Rejects traversal and hidden files."""
+        root_dir = os.path.realpath(self.contents_manager.root_dir)
+        resolved = os.path.realpath(os.path.join(root_dir, path))
+        if not resolved.startswith(root_dir + os.sep):
+            raise ValueError('path escapes content root')
+        rel = os.path.relpath(resolved, root_dir)
+        for part in rel.split(os.sep):
+            if part.startswith('.'):
+                raise ValueError('hidden files are not accessible')
+        return resolved
+
+    @tornado.web.authenticated
+    def post(self):
+        nblibram_path = shutil.which('nblibram')
+        if not nblibram_path:
+            self.set_status(500)
+            self.finish(json.dumps({'error': 'nblibram not found in PATH'}))
+            return
+
+        data = self.get_json_body()
+        command = data.get('command', '')
+        if command not in _NBLIBRAM_COMMANDS:
+            self.set_status(400)
+            self.finish(json.dumps({'error': f'unknown command: {command}'}))
+            return
+
+        # Resolve file path
+        path = data.get('path', '')
+        live = data.get('live', False)
+        notebook_content = data.get('notebookContent')
+
+        if live:
+            # Live notebook query: use temp store
+            store_key = os.path.normpath(path)
+            if notebook_content is not None:
+                store_path = _get_store_path(store_key)
+                with open(store_path, 'w') as f:
+                    json.dump(notebook_content, f)
+            if store_key not in _notebook_stores:
+                self.set_status(400)
+                self.finish(json.dumps({'error': 'No notebook content in store. Send notebookContent first.'}))
+                return
+            file_arg = _notebook_stores[store_key]
+        elif path:
+            # File-based query: read from disk
+            try:
+                file_arg = self._validate_path(path)
+            except ValueError as e:
+                self.set_status(400)
+                self.finish(json.dumps({'error': str(e)}))
+                return
+        else:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'path is required'}))
+            return
+
+        # Build CLI args from structured params
+        args = ['-file', file_arg]
+
+        fmt = data.get('format')
+        if fmt:
+            if fmt not in _NBLIBRAM_FORMATS:
+                self.set_status(400)
+                self.finish(json.dumps({'error': f'unknown format: {fmt}'}))
+                return
+            args += ['-format', fmt]
+
+        query = data.get('query')
+        if query:
+            if not isinstance(query, str):
+                self.set_status(400)
+                self.finish(json.dumps({'error': 'query must be a string'}))
+                return
+            args += ['-query', query]
+
+        count = data.get('count')
+        if count is not None:
+            args += ['-count', str(int(count))]
+
+        if data.get('noFilter'):
+            args.append('-no-filter')
+
+        if data.get('excludeOutputs'):
+            args.append('-exclude-outputs')
+
+        cmd = [nblibram_path, command] + args
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            self.set_status(400)
+            self.finish(json.dumps({'error': result.stderr.strip()}))
+            return
+
+        try:
+            parsed = json.loads(result.stdout)
+            self.finish(json.dumps(parsed))
+        except json.JSONDecodeError:
+            self.finish(json.dumps({'output': result.stdout}))
+
+
+class EnkiGateDeviceFlowHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self):
+        data = self.get_json_body()
+        enki_url = data.get('enkiGateUrl', '').rstrip('/')
+        if not enki_url:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'enkiGateUrl is required'}))
+            return
+
+
+        req = urllib.request.Request(f'{enki_url}/api/device-flows', method='POST')
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = json.loads(resp.read())
+            self.finish(json.dumps(body))
+        except urllib.error.HTTPError as e:
+            self.set_status(e.code)
+            self.finish(json.dumps({'error': e.read().decode()}))
+
+
+class EnkiGateDeviceFlowPollHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self, device_code):
+        data = self.get_json_body()
+        enki_url = data.get('enkiGateUrl', '').rstrip('/')
+        if not enki_url:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'enkiGateUrl is required'}))
+            return
+
+
+        req = urllib.request.Request(
+            f'{enki_url}/api/device-flows/{device_code}/poll',
+            method='POST'
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = json.loads(resp.read())
+            self.finish(json.dumps(body))
+        except urllib.error.HTTPError as e:
+            self.set_status(e.code)
+            self.finish(json.dumps({'error': e.read().decode()}))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -470,12 +693,18 @@ def setup_route_handlers(web_app):
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
+    nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
+    enki_device_flow_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows')
+    enki_device_flow_poll_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows', '([^/]+)', 'poll')
     handlers = [
         (providers_pattern, ProvidersHandler),
         (config_pattern, ConfigHandler),
         (chat_pattern, ChatHandler),
         (sessions_pattern, SessionsHandler),
-        (session_pattern, SessionHandler)
+        (session_pattern, SessionHandler),
+        (nblibram_pattern, NblibramHandler),
+        (enki_device_flow_pattern, EnkiGateDeviceFlowHandler),
+        (enki_device_flow_poll_pattern, EnkiGateDeviceFlowPollHandler)
     ]
 
     web_app.add_handlers(host_pattern, handlers)

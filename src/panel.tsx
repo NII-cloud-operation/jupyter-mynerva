@@ -1,6 +1,6 @@
 import { ILabShell } from '@jupyterlab/application';
 import { ServerConnection } from '@jupyterlab/services';
-import { ReactWidget, settingsIcon } from '@jupyterlab/ui-components';
+import { ReactWidget, settingsIcon, copyIcon } from '@jupyterlab/ui-components';
 import * as React from 'react';
 import { marked } from 'marked';
 
@@ -17,9 +17,14 @@ import {
   MutateActionCard,
   DropdownButton
 } from './actions';
-import { buildSystemPrompt } from './systemPrompt';
-import { IFilter, applyFilters } from './filter';
-import { NotebookFileReader } from './notebookFile';
+import { buildSystemPrompt, getActionHelp } from './systemPrompt';
+import {
+  NblibramLiveQuery,
+  nblibramTocFromFile,
+  nblibramSectionFromFile,
+  nblibramCellsFromFile,
+  nblibramOutputsFromFile
+} from './nblibram';
 import { mynervaIcon } from './icons';
 
 const PANEL_CLASS = 'jp-Mynerva-panel';
@@ -34,8 +39,13 @@ interface IMessage {
 interface IConfig {
   provider: string;
   model: string;
+  decryptError?: string;
   apiKey: string;
   useDefault?: boolean;
+  enkiGateUrl?: string;
+  enkiGateToken?: string;
+  enkiGateModel?: string;
+  enkiGateExpiresAt?: number;
 }
 
 interface IDefaultConfig {
@@ -53,7 +63,6 @@ interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
-  filters: IFilter[];
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -258,6 +267,199 @@ interface ISettingsViewProps {
   defaults: IDefaultConfig | null;
   defaultsUnavailable: boolean;
   onSave: (config: IConfig) => void;
+  warning?: string;
+}
+
+function CopyableCode({ code }: { code: string }): React.ReactElement {
+  const [copied, setCopied] = React.useState(false);
+
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div style={{ textAlign: 'center' }}>
+      <div style={{ fontSize: '0.85em', color: '#666', marginBottom: '4px' }}>
+        and enter this code
+      </div>
+      <div
+        style={{
+          fontSize: '1.8em',
+          fontWeight: 'bold',
+          letterSpacing: '0.1em',
+          color: '#333',
+          cursor: 'pointer'
+        }}
+        title="Click to copy"
+        onClick={handleCopy}
+      >
+        {code}{' '}
+        <span
+          style={{
+            verticalAlign: 'middle',
+            marginLeft: '4px',
+            display: 'inline-block'
+          }}
+        >
+          <copyIcon.react tag="span" width="16px" height="16px" />
+        </span>
+      </div>
+      {copied && (
+        <div style={{ fontSize: '0.8em', color: '#4a86c8', marginTop: '4px' }}>
+          Copied!
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EnkiGateSettings({
+  config,
+  onSave
+}: {
+  config: IConfig;
+  onSave: (config: IConfig) => void;
+}): React.ReactElement {
+  const [enkiUrl, setEnkiUrl] = React.useState(
+    config.enkiGateUrl || 'https://enki-gate.web.app'
+  );
+  const [connecting, setConnecting] = React.useState(false);
+  const [verificationUri, setVerificationUri] = React.useState('');
+  const [userCode, setUserCode] = React.useState('');
+  const [error, setError] = React.useState('');
+
+  const tokenValid =
+    config.enkiGateToken &&
+    config.enkiGateExpiresAt &&
+    config.enkiGateExpiresAt > Date.now();
+
+  const startDeviceFlow = async () => {
+    setConnecting(true);
+    setError('');
+    setVerificationUri('');
+    setUserCode('');
+    try {
+      const settings = ServerConnection.makeSettings();
+      const url = `${settings.baseUrl}jupyter-mynerva/enki-gate/device-flows`;
+      const resp = await ServerConnection.makeRequest(
+        url,
+        { method: 'POST', body: JSON.stringify({ enkiGateUrl: enkiUrl }) },
+        settings
+      );
+      if (!resp.ok) {
+        const body = await resp.json();
+        throw new Error(body.error || 'Failed to start device flow');
+      }
+      const data = await resp.json();
+      setVerificationUri(data.verification_uri);
+      setUserCode(data.user_code);
+
+      const interval = (data.interval || 5) * 1000;
+      const pollUrl = `${settings.baseUrl}jupyter-mynerva/enki-gate/device-flows/${encodeURIComponent(data.device_code)}/poll`;
+
+      const poll = async (): Promise<void> => {
+        const pollResp = await ServerConnection.makeRequest(
+          pollUrl,
+          { method: 'POST', body: JSON.stringify({ enkiGateUrl: enkiUrl }) },
+          settings
+        );
+        if (!pollResp.ok) {
+          throw new Error('Polling failed');
+        }
+        const pollData = await pollResp.json();
+        if (pollData.status === 'pending') {
+          await new Promise(r => setTimeout(r, interval));
+          return poll();
+        }
+        if (pollData.status === 'completed') {
+          const newConfig: IConfig = {
+            ...config,
+            provider: 'enki-gate',
+            model: '',
+            apiKey: '',
+            enkiGateUrl: enkiUrl,
+            enkiGateToken: pollData.access_token,
+            enkiGateModel: pollData.selected_model || '',
+            enkiGateExpiresAt: Date.now() + (pollData.expires_in || 3600) * 1000
+          };
+          await saveConfig(newConfig);
+          onSave(newConfig);
+          setVerificationUri('');
+          setUserCode('');
+          return;
+        }
+        throw new Error(`Unexpected status: ${pollData.status}`);
+      };
+
+      await poll();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Device flow failed');
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const remainingMinutes = tokenValid
+    ? Math.ceil(((config.enkiGateExpiresAt ?? 0) - Date.now()) / 60000)
+    : 0;
+
+  return (
+    <>
+      <div className="jp-Mynerva-settings-field">
+        <label>Enki Gate URL</label>
+        <input
+          type="text"
+          value={enkiUrl}
+          onChange={e => setEnkiUrl(e.target.value)}
+          placeholder="https://enki-gate.web.app"
+        />
+      </div>
+      {tokenValid && (
+        <div className="jp-Mynerva-settings-warning">
+          Connected ({config.enkiGateModel}). Token expires in{' '}
+          {remainingMinutes}m.
+        </div>
+      )}
+      {connecting && verificationUri && (
+        <div
+          style={{
+            padding: '12px',
+            background: '#f0f4ff',
+            border: '1px solid #4a86c8',
+            borderRadius: '4px'
+          }}
+        >
+          <a
+            href={verificationUri}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              display: 'block',
+              textAlign: 'center',
+              padding: '10px',
+              marginBottom: '12px',
+              background: '#4a86c8',
+              color: 'white',
+              borderRadius: '4px',
+              textDecoration: 'none',
+              fontWeight: 'bold'
+            }}
+          >
+            Open Enki Gate
+          </a>
+          <CopyableCode code={userCode} />
+        </div>
+      )}
+      {error && <div className="jp-Mynerva-settings-error">{error}</div>}
+      {!connecting && (
+        <button className="jp-Mynerva-settings-save" onClick={startDeviceFlow}>
+          {tokenValid ? 'Reconnect' : 'Connect'}
+        </button>
+      )}
+    </>
+  );
 }
 
 function SettingsView({
@@ -266,7 +468,8 @@ function SettingsView({
   encryption,
   defaults,
   defaultsUnavailable,
-  onSave
+  onSave,
+  warning
 }: ISettingsViewProps): React.ReactElement {
   const [useDefault, setUseDefault] = React.useState(
     defaultsUnavailable ? false : (config.useDefault ?? false)
@@ -285,7 +488,7 @@ function SettingsView({
     setProvider(newProvider);
     const newProviderData = providers.find(p => p.id === newProvider);
     if (newProviderData && !newProviderData.models.includes(model)) {
-      setModel(newProviderData.models[0]);
+      setModel(newProviderData.models[0] || '');
     }
   };
 
@@ -325,10 +528,10 @@ function SettingsView({
       )}
       {!useDefault && (
         <>
-          {!encryption && (
+          {!encryption && !warning && provider !== 'enki-gate' && (
             <div className="jp-Mynerva-settings-warning">
               API keys are stored unencrypted. Set MYNERVA_SECRET_KEY for
-              encryption.
+              encryption, or use Enki Gate for short-lived tokens.
             </div>
           )}
           <div className="jp-Mynerva-settings-field">
@@ -344,35 +547,44 @@ function SettingsView({
               ))}
             </select>
           </div>
-          <div className="jp-Mynerva-settings-field">
-            <label>Model</label>
-            <select value={model} onChange={e => setModel(e.target.value)}>
-              {models.map(m => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="jp-Mynerva-settings-field">
-            <label>API Key</label>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              placeholder="Enter API key"
-            />
-          </div>
+          {provider === 'enki-gate' ? (
+            <EnkiGateSettings config={config} onSave={onSave} />
+          ) : (
+            <>
+              <div className="jp-Mynerva-settings-field">
+                <label>Model</label>
+                <select value={model} onChange={e => setModel(e.target.value)}>
+                  {models.map(m => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="jp-Mynerva-settings-field">
+                <label>API Key</label>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  placeholder="Enter API key"
+                />
+              </div>
+            </>
+          )}
         </>
       )}
+      {warning && <div className="jp-Mynerva-settings-error">{warning}</div>}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
-      <button
-        className="jp-Mynerva-settings-save"
-        onClick={handleSave}
-        disabled={saving}
-      >
-        {saving ? 'Saving...' : 'Save'}
-      </button>
+      {provider !== 'enki-gate' && (
+        <button
+          className="jp-Mynerva-settings-save"
+          onClick={handleSave}
+          disabled={saving}
+        >
+          {saving ? 'Saving...' : 'Save'}
+        </button>
+      )}
     </div>
   );
 }
@@ -386,7 +598,9 @@ const QUERY_ACTION_TYPES = [
   'getTocFromFile',
   'getSectionFromFile',
   'getCellsFromFile',
-  'getOutputFromFile'
+  'getOutputFromFile',
+  'listHelp',
+  'help'
 ];
 const MUTATE_ACTION_TYPES = [
   'insertCell',
@@ -664,7 +878,7 @@ function ChatView({
               checked={filterEnabled}
               onChange={e => onFilterToggle(e.target.checked)}
             />
-            Privacy filter (.nbfilterrc.toml)
+            Privacy filter
           </label>
           {loading ? (
             <button className="jp-Mynerva-cancel" onClick={onCancelLoading}>
@@ -687,10 +901,12 @@ function ChatView({
 
 interface IMynervaComponentProps {
   contextEngine: ContextEngine;
+  liveQuery: NblibramLiveQuery;
 }
 
 function MynervaComponent({
-  contextEngine
+  contextEngine,
+  liveQuery
 }: IMynervaComponentProps): React.ReactElement {
   const [providers, setProviders] = React.useState<IProvider[]>([]);
   const [encryption, setEncryption] = React.useState(false);
@@ -701,8 +917,8 @@ function MynervaComponent({
   const [loading, setLoading] = React.useState(false);
   const [initializing, setInitializing] = React.useState(true);
   const [initError, setInitError] = React.useState<string | null>(null);
-  const [filters, setFilters] = React.useState<IFilter[]>([]);
   const [filterEnabled, setFilterEnabled] = React.useState(true);
+  liveQuery.filterEnabled = filterEnabled;
   // Auto-approval for active notebook: Map<notebookPath, Set<actionType>>
   const [autoApproved, setAutoApproved] = React.useState<
     Map<string, Set<ActionType>>
@@ -726,18 +942,16 @@ function MynervaComponent({
   React.useEffect(() => {
     Promise.all([getProviders(), getConfig(), getSessions()])
       .then(async ([providersRes, cfg, sessionsRes]) => {
-        if (!providersRes.filters) {
-          throw new Error('Server did not return privacy filter configuration');
-        }
         setProviders(providersRes.providers);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
-        setFilters(providersRes.filters);
         setConfig(cfg);
         setSessions(sessionsRes.sessions);
         setSessionLoadErrors(sessionsRes.errors);
 
-        // Start with empty new session (don't auto-load past sessions)
+        if (cfg.decryptError) {
+          setShowSettings(true);
+        }
 
         // Show settings if:
         // - no API key and not using defaults, OR
@@ -762,11 +976,6 @@ function MynervaComponent({
 
   // Queue of action results waiting to be sent
   const [pendingResults, setPendingResults] = React.useState<string[]>([]);
-
-  // NotebookFileReader for file queries
-  const fileReaderRef = React.useRef<NotebookFileReader>(
-    new NotebookFileReader()
-  );
 
   // Flag to prevent duplicate execution from useEffect during batch operations
   const executingActionsRef = React.useRef(false);
@@ -836,36 +1045,24 @@ function MynervaComponent({
     let result: string;
     switch (action.type) {
       case 'getToc': {
-        const path = contextEngine.getNotebookPath();
-        const toc = contextEngine.getToc();
-        result = JSON.stringify({ type: 'getToc', path, result: toc }, null, 2);
+        const toc = await liveQuery.getToc();
+        result = JSON.stringify({ type: 'getToc', result: toc }, null, 2);
         break;
       }
       case 'getSection': {
-        const path = contextEngine.getNotebookPath();
-        const cells = contextEngine.getSection(action.query);
-        result = JSON.stringify(
-          { type: 'getSection', path, result: cells },
-          null,
-          2
-        );
+        const cells = await liveQuery.getSection(action.query);
+        result = JSON.stringify({ type: 'getSection', result: cells }, null, 2);
         break;
       }
       case 'getCells': {
-        const path = contextEngine.getNotebookPath();
-        const cells = contextEngine.queryCells(action.query, action.count);
-        result = JSON.stringify(
-          { type: 'getCells', path, result: cells },
-          null,
-          2
-        );
+        const cells = await liveQuery.getCells(action.query, action.count);
+        result = JSON.stringify({ type: 'getCells', result: cells }, null, 2);
         break;
       }
       case 'getOutput': {
-        const path = contextEngine.getNotebookPath();
-        const outputs = contextEngine.getOutput(action.query);
+        const outputs = await liveQuery.getOutput(action.query);
         result = JSON.stringify(
-          { type: 'getOutput', path, result: outputs },
+          { type: 'getOutput', result: outputs },
           null,
           2
         );
@@ -881,15 +1078,19 @@ function MynervaComponent({
       }
       case 'help': {
         result = JSON.stringify(
-          { type: 'help', result: `Help for action: ${action.action}` },
+          { type: 'help', result: getActionHelp(action.action) },
           null,
           2
         );
         break;
       }
       case 'listNotebookFiles': {
-        const fileReader = fileReaderRef.current;
-        const files = await fileReader.listNotebooks(action.path || '');
+        const { ContentsManager } = await import('@jupyterlab/services');
+        const contents = new ContentsManager();
+        const model = await contents.get(action.path || '');
+        const files = (model.content as { type: string; path: string }[])
+          .filter(item => item.type === 'notebook')
+          .map(item => item.path);
         result = JSON.stringify(
           { type: 'listNotebookFiles', path: action.path || '', result: files },
           null,
@@ -898,8 +1099,7 @@ function MynervaComponent({
         break;
       }
       case 'getTocFromFile': {
-        const fileReader = fileReaderRef.current;
-        const toc = await fileReader.getToc(action.path);
+        const toc = await nblibramTocFromFile(action.path);
         result = JSON.stringify(
           { type: 'getTocFromFile', path: action.path, result: toc },
           null,
@@ -908,8 +1108,7 @@ function MynervaComponent({
         break;
       }
       case 'getSectionFromFile': {
-        const fileReader = fileReaderRef.current;
-        const cells = await fileReader.getSection(action.path, action.query);
+        const cells = await nblibramSectionFromFile(action.path, action.query);
         result = JSON.stringify(
           { type: 'getSectionFromFile', path: action.path, result: cells },
           null,
@@ -918,8 +1117,7 @@ function MynervaComponent({
         break;
       }
       case 'getCellsFromFile': {
-        const fileReader = fileReaderRef.current;
-        const cells = await fileReader.getCells(
+        const cells = await nblibramCellsFromFile(
           action.path,
           action.query,
           action.count
@@ -932,8 +1130,10 @@ function MynervaComponent({
         break;
       }
       case 'getOutputFromFile': {
-        const fileReader = fileReaderRef.current;
-        const outputs = await fileReader.getOutput(action.path, action.query);
+        const outputs = await nblibramOutputsFromFile(
+          action.path,
+          action.query
+        );
         result = JSON.stringify(
           { type: 'getOutputFromFile', path: action.path, result: outputs },
           null,
@@ -949,9 +1149,6 @@ function MynervaComponent({
         );
     }
 
-    if (filterEnabled && filters.length > 0) {
-      result = applyFilters(result, filters);
-    }
     return result;
   };
 
@@ -1583,6 +1780,7 @@ function MynervaComponent({
           defaults={defaults}
           defaultsUnavailable={!!(config?.useDefault && !defaults)}
           onSave={handleConfigSave}
+          warning={config?.decryptError}
         />
       ) : (
         <ChatView
@@ -1608,10 +1806,12 @@ function MynervaComponent({
 
 export class MynervaPanel extends ReactWidget {
   private _contextEngine: ContextEngine;
+  private _liveQuery: NblibramLiveQuery;
 
-  constructor(contextEngine: ContextEngine) {
+  constructor(contextEngine: ContextEngine, liveQuery: NblibramLiveQuery) {
     super();
     this._contextEngine = contextEngine;
+    this._liveQuery = liveQuery;
     this.id = 'mynerva-panel';
     this.title.icon = mynervaIcon;
     this.title.caption = 'Mynerva';
@@ -1619,14 +1819,20 @@ export class MynervaPanel extends ReactWidget {
   }
 
   render(): React.ReactElement {
-    return <MynervaComponent contextEngine={this._contextEngine} />;
+    return (
+      <MynervaComponent
+        contextEngine={this._contextEngine}
+        liveQuery={this._liveQuery}
+      />
+    );
   }
 }
 
 export function activatePanel(
   shell: ILabShell,
-  contextEngine: ContextEngine
+  contextEngine: ContextEngine,
+  liveQuery: NblibramLiveQuery
 ): void {
-  const panel = new MynervaPanel(contextEngine);
+  const panel = new MynervaPanel(contextEngine, liveQuery);
   shell.add(panel, 'right', { rank: 1000 });
 }

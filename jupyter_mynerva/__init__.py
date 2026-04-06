@@ -7,6 +7,8 @@ except ImportError:
     import warnings
     warnings.warn("Importing 'jupyter_mynerva' outside a proper installation.")
     __version__ = "dev"
+import shutil
+
 from .routes import setup_route_handlers
 
 
@@ -31,6 +33,13 @@ def _load_jupyter_server_extension(server_app):
     server_app: jupyterlab.labapp.LabApp
         JupyterLab application instance
     """
+    if not shutil.which('nblibram'):
+        server_app.log.warning(
+            "nblibram not found in PATH. "
+            "Notebook query features will not work. "
+            "Install from https://github.com/NII-cloud-operation/nblibram/releases"
+        )
+
     setup_route_handlers(server_app.web_app)
     name = "jupyter_mynerva"
     server_app.log.info(f"Registered {name} server extension")

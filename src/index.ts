@@ -9,6 +9,7 @@ import { INotebookTracker } from '@jupyterlab/notebook';
 
 import { activatePanel } from './panel';
 import { ContextEngine } from './context';
+import { NblibramLiveQuery } from './nblibram';
 
 const plugin: JupyterFrontEndPlugin<void> = {
   id: 'jupyter-mynerva:plugin',
@@ -26,7 +27,8 @@ const plugin: JupyterFrontEndPlugin<void> = {
     console.log('JupyterLab extension jupyter-mynerva is activated!');
 
     const contextEngine = new ContextEngine(notebookTracker);
-    activatePanel(shell, contextEngine);
+    const liveQuery = new NblibramLiveQuery(notebookTracker);
+    activatePanel(shell, contextEngine, liveQuery);
 
     if (settingRegistry) {
       settingRegistry

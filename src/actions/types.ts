@@ -20,7 +20,9 @@ export type IQueryAction =
   | IGetTocFromFileAction
   | IGetSectionFromFileAction
   | IGetCellsFromFileAction
-  | IGetOutputFromFileAction;
+  | IGetOutputFromFileAction
+  | IListHelpAction
+  | IHelpDetailAction;
 
 /**
  * Mutate action types (modify notebook, displayed on assistant side)
@@ -32,14 +34,9 @@ export type IMutateAction =
   | IRunCellAction;
 
 /**
- * Help action types
- */
-export type IHelpAction = IListHelpAction | IHelpDetailAction;
-
-/**
  * All action types
  */
-export type IAction = IQueryAction | IMutateAction | IHelpAction;
+export type IAction = IQueryAction | IMutateAction;
 
 export interface IGetTocAction {
   type: 'getToc';
