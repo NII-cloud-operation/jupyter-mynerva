@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags: '*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Base Setup
+      uses: jupyterlab/maintainer-tools/.github/actions/base-setup@v1
+
+    - name: Install nblibram
+      run: |
+        gh release download -R NII-cloud-operation/nblibram -p 'nblibram_linux_amd64.tar.gz' -D /tmp
+        tar xzf /tmp/nblibram_linux_amd64.tar.gz -C /usr/local/bin nblibram
+        which nblibram
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Install dependencies
+      run: python -m pip install -U 'jupyterlab>=4.0.0,<5'
+    - name: Build the extension
+      run: |
+        set -eux
+        jlpm
+        jlpm run lint:check
+        python -m pip install .[test]
+
+        jupyter server extension list 2>&1 | grep -ie "jupyter_mynerva.*OK"
+
+        jupyter labextension list 2>&1 | grep -ie "jupyter-mynerva.*OK"
+        python -m jupyterlab.browser_check
+
+        python -m pytest tests/ -v
+
+        jlpm install
+        cd ./ui-tests
+        jlpm install
+        jlpm playwright install
+        jlpm playwright test
+        cd ..
+
+        pip install build
+        python -m build --sdist
+        cp dist/*.tar.gz myextension.tar.gz
+        pip uninstall -y "jupyter_mynerva" jupyterlab
+        rm -rf myextension
+
+        npm pack
+        mv jupyter-mynerva-*.tgz myextension-nodejs.tgz
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: myextension-sdist
+        path: myextension.tar.gz
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: myextension-nodejs
+        path: myextension-nodejs.tgz
+
+  draft_release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - uses: actions/download-artifact@v4
+      with:
+        name: myextension-sdist
+    - uses: actions/download-artifact@v4
+      with:
+        name: myextension-nodejs
+    - name: release
+      uses: actions/create-release@v1
+      id: create_release
+      with:
+        draft: true
+        prerelease: false
+        release_name: ${{ github.ref }}
+        tag_name: ${{ github.ref }}
+        body_path: CHANGELOG.md
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    - name: upload pip package
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: myextension.tar.gz
+        asset_name: jupyter_mynerva-${{ github.ref_name }}.tar.gz
+        asset_content_type: application/gzip
+    - name: upload nodejs package
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: myextension-nodejs.tgz
+        asset_name: jupyter_mynerva-${{ github.ref_name }}.tgz
+        asset_content_type: application/gzip
