@@ -242,6 +242,7 @@ Administrators can provide default LLM settings via environment variables. Users
 | `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                       |
 | `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai` or `anthropic`)                      |
 | `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, fetched from endpoint if not set) |
+| `MYNERVA_DEFAULTS_ONLY`     | Lock LLM settings to admin defaults (hides settings UI)         |
 
 **Provider auto-detection:**
 

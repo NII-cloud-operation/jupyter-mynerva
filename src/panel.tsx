@@ -71,6 +71,7 @@ interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
+  defaultsOnly?: boolean;
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -1045,6 +1046,7 @@ function MynervaComponent({
   const [providers, setProviders] = React.useState<IProvider[]>([]);
   const [encryption, setEncryption] = React.useState(false);
   const [defaults, setDefaults] = React.useState<IDefaultConfig | null>(null);
+  const [defaultsOnly, setDefaultsOnly] = React.useState(false);
   const [config, setConfig] = React.useState<IConfig | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
   const [messages, setMessages] = React.useState<IMessage[]>([]);
@@ -1079,25 +1081,30 @@ function MynervaComponent({
         setProviders(providersRes.providers);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
+        if (providersRes.defaultsOnly) {
+          setDefaultsOnly(true);
+        }
         setConfig(cfg);
         setSessions(sessionsRes.sessions);
         setSessionLoadErrors(sessionsRes.errors);
 
-        if (cfg.decryptError || cfg.configWarning) {
+        if (providersRes.defaultsOnly) {
+          // Settings screen is not available in defaults-only mode
+        } else if (cfg.decryptError || cfg.configWarning) {
           setShowSettings(true);
-        }
-
-        // Show settings if:
-        // - no API key (and no base URL) and not using defaults, OR
-        // - useDefault is set but defaults are not available
-        const defaultsUnavailable = cfg.useDefault && !providersRes.defaults;
-        const enkiGateValid =
-          cfg.enkiGateToken &&
-          cfg.enkiGateExpiresAt &&
-          cfg.enkiGateExpiresAt > Date.now();
-        const hasAuth = cfg.apiKey || cfg.openaiBaseUrl || enkiGateValid;
-        if ((!hasAuth && !cfg.useDefault) || defaultsUnavailable) {
-          setShowSettings(true);
+        } else {
+          // Show settings if:
+          // - no API key (and no base URL) and not using defaults, OR
+          // - useDefault is set but defaults are not available
+          const defaultsUnavailable = cfg.useDefault && !providersRes.defaults;
+          const enkiGateValid =
+            cfg.enkiGateToken &&
+            cfg.enkiGateExpiresAt &&
+            cfg.enkiGateExpiresAt > Date.now();
+          const hasAuth = cfg.apiKey || cfg.openaiBaseUrl || enkiGateValid;
+          if ((!hasAuth && !cfg.useDefault) || defaultsUnavailable) {
+            setShowSettings(true);
+          }
         }
       })
       .catch(e => {
@@ -1890,13 +1897,15 @@ function MynervaComponent({
               </div>
             )}
           </div>
-          <button
-            className="jp-Mynerva-header-button"
-            onClick={() => setShowSettings(!showSettings)}
-            title="Settings"
-          >
-            <settingsIcon.react tag="span" />
-          </button>
+          {!defaultsOnly && (
+            <button
+              className="jp-Mynerva-header-button"
+              onClick={() => setShowSettings(!showSettings)}
+              title="Settings"
+            >
+              <settingsIcon.react tag="span" />
+            </button>
+          )}
         </div>
       </div>
       {sessionError && (

@@ -136,6 +136,9 @@ if 'MYNERVA_DEFAULT_MODEL' in os.environ:
 if 'MYNERVA_OPENAI_BASE_URL' in os.environ:
     _DEFAULT_CONFIG['openai_base_url'] = os.environ['MYNERVA_OPENAI_BASE_URL']
 
+if os.environ.get('MYNERVA_DEFAULTS_ONLY'):
+    _DEFAULT_CONFIG['defaults_only'] = True
+
 
 def _get_provider_models(provider_id):
     """Returns model list for the given provider."""
@@ -227,7 +230,7 @@ def resolve_chat_config(config):
     All fields come from the same source (defaults or user config)
     to prevent credential leakage across trust boundaries.
     """
-    if config.get('useDefault'):
+    if _DEFAULT_CONFIG.get('defaults_only') or config.get('useDefault'):
         defaults = get_default_config()
         if not defaults:
             raise ValueError('Default configuration not available')
@@ -335,12 +338,15 @@ class ProvidersHandler(APIHandler):
             self.finish(json.dumps({'error': f'Filter config error: {e}'}))
             return
 
-        self.finish(json.dumps({
+        result = {
             'providers': PROVIDERS,
             'encryption': is_encryption_configured(),
             'defaults': get_default_config(),
             'filters': filters
-        }))
+        }
+        if _DEFAULT_CONFIG.get('defaults_only'):
+            result['defaultsOnly'] = True
+        self.finish(json.dumps(result))
 
 
 class ConfigHandler(APIHandler):

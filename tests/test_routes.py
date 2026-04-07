@@ -254,6 +254,29 @@ def test_resolve_chat_config_user_config(monkeypatch):
     assert base_url == 'http://user-endpoint/v1'
 
 
+def test_resolve_chat_config_defaults_only(monkeypatch):
+    """defaults_only ignores user config even when useDefault is false."""
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'openai_api_key': 'admin-key',
+        'openai_base_url': 'http://admin-endpoint/v1',
+        'defaults_only': True,
+    })
+    monkeypatch.setattr('jupyter_mynerva.routes.get_default_config',
+                        lambda: {'provider': 'openai', 'model': 'admin-model'})
+
+    config = {
+        'provider': 'anthropic',
+        'model': 'claude-sonnet-4-5-20250929',
+        'apiKey': 'user-key',
+    }
+    provider, model, api_key, base_url = resolve_chat_config(config)
+
+    assert provider == 'openai'
+    assert model == 'admin-model'
+    assert api_key == 'admin-key'
+    assert base_url == 'http://admin-endpoint/v1'
+
+
 def test_resolve_chat_config_no_defaults_raises(monkeypatch):
     monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {})
     monkeypatch.setattr('jupyter_mynerva.routes.get_default_config', lambda: None)
