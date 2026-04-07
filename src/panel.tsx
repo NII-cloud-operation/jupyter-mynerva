@@ -670,6 +670,7 @@ interface IChatViewProps {
   onAcceptAllAlways: (msgIndex: number) => void;
   onRejectAll: (msgIndex: number) => void;
   getActionStatus: (msgIndex: number, actionIndex: number) => ActionStatus;
+  actionResultUrls: Map<string, string>;
   loading: boolean;
   onCancelLoading: () => void;
   hasPendingActions: boolean;
@@ -696,6 +697,7 @@ function ChatView({
   onAcceptAllAlways,
   onRejectAll,
   getActionStatus,
+  actionResultUrls,
   loading,
   onCancelLoading,
   hasPendingActions,
@@ -806,6 +808,7 @@ function ChatView({
                             key={actionIndex}
                             action={action}
                             status={getActionStatus(msgIndex, actionIndex)}
+                            resultUrl={actionResultUrls.get(`${msgIndex}:${actionIndex}`)}
                             onApprove={() =>
                               onActionApprove(msgIndex, actionIndex)
                             }
@@ -943,6 +946,10 @@ function MynervaComponent({
   const [sessionError, setSessionError] = React.useState<string | null>(null);
   const [showSessions, setShowSessions] = React.useState(false);
   const [agentMode, setAgentMode] = React.useState(false);
+  // Map from "msgIndex:actionIndex" to result URL (for startAgentServer)
+  const [actionResultUrls, setActionResultUrls] = React.useState<
+    Map<string, string>
+  >(new Map());
 
   // AbortController for cancelling chat requests
   const abortControllerRef = React.useRef<AbortController | null>(null);
@@ -1280,6 +1287,15 @@ function MynervaComponent({
         null,
         2
       );
+    }
+
+    if (action.type === 'startAgentServer') {
+      const parsed = JSON.parse(result);
+      setActionResultUrls(prev => {
+        const next = new Map(prev);
+        next.set(`${msgIndex}:${actionIndex}`, parsed.result.url);
+        return next;
+      });
     }
 
     setPendingResults(prev => [...prev, result]);
@@ -1827,6 +1843,7 @@ function MynervaComponent({
           onAcceptAllAlways={handleAcceptAllAlways}
           onRejectAll={handleRejectAll}
           getActionStatus={getActionStatus}
+          actionResultUrls={actionResultUrls}
           loading={loading}
           onCancelLoading={handleCancelLoading}
           hasPendingActions={hasPendingActions}

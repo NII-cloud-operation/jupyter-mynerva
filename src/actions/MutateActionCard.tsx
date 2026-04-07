@@ -5,6 +5,7 @@ import { DropdownButton } from './DropdownButton';
 interface IMutateActionCardProps {
   action: IMutateAction;
   status: ActionStatus;
+  resultUrl?: string;
   onApprove: () => void;
   onApproveAlways: () => void;
   onReject: () => void;
@@ -44,6 +45,7 @@ function getPreviewContent(action: IMutateAction): string | null {
 export function MutateActionCard({
   action,
   status,
+  resultUrl,
   onApprove,
   onApproveAlways,
   onReject
@@ -97,9 +99,21 @@ export function MutateActionCard({
         </div>
       )}
       {status === 'executed' && (
-        <div className="jp-Mynerva-action-badge jp-Mynerva-applied-badge">
-          Applied
-        </div>
+        <>
+          <div className="jp-Mynerva-action-badge jp-Mynerva-applied-badge">
+            Applied
+          </div>
+          {resultUrl && (
+            <a
+              className="jp-Mynerva-action-link"
+              href={resultUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open Agent Environment
+            </a>
+          )}
+        </>
       )}
       {(status === 'rejected' || status === 'notified') && (
         <div className="jp-Mynerva-action-badge jp-Mynerva-cancelled-badge">
