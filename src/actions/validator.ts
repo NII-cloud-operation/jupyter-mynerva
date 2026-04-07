@@ -60,6 +60,10 @@ const ACTION_SCHEMAS: Record<
     required: ['query'],
     optional: []
   },
+  startAgentServer: {
+    required: ['ssh'],
+    optional: []
+  },
   // Help actions
   listHelp: {
     required: [],

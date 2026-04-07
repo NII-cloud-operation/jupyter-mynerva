@@ -63,6 +63,7 @@ interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
+  agentMode: boolean;
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -606,7 +607,8 @@ const MUTATE_ACTION_TYPES = [
   'insertCell',
   'updateCell',
   'deleteCell',
-  'runCell'
+  'runCell',
+  'startAgentServer'
 ];
 
 // Query hierarchy: higher level permits lower levels
@@ -627,7 +629,12 @@ function isMutateAction(action: IAction): action is IMutateAction {
 }
 
 type QueryActionType = 'getToc' | 'getSection' | 'getCells' | 'getOutput';
-type MutateActionType = 'insertCell' | 'updateCell' | 'deleteCell' | 'runCell';
+type MutateActionType =
+  | 'insertCell'
+  | 'updateCell'
+  | 'deleteCell'
+  | 'runCell'
+  | 'startAgentServer';
 type ActionType = QueryActionType | MutateActionType;
 
 function isQueryAutoApproved(
@@ -663,6 +670,7 @@ interface IChatViewProps {
   onAcceptAllAlways: (msgIndex: number) => void;
   onRejectAll: (msgIndex: number) => void;
   getActionStatus: (msgIndex: number, actionIndex: number) => ActionStatus;
+  actionResultUrls: Map<string, string>;
   loading: boolean;
   onCancelLoading: () => void;
   hasPendingActions: boolean;
@@ -689,6 +697,7 @@ function ChatView({
   onAcceptAllAlways,
   onRejectAll,
   getActionStatus,
+  actionResultUrls,
   loading,
   onCancelLoading,
   hasPendingActions,
@@ -799,6 +808,7 @@ function ChatView({
                             key={actionIndex}
                             action={action}
                             status={getActionStatus(msgIndex, actionIndex)}
+                            resultUrl={actionResultUrls.get(`${msgIndex}:${actionIndex}`)}
                             onApprove={() =>
                               onActionApprove(msgIndex, actionIndex)
                             }
@@ -935,6 +945,11 @@ function MynervaComponent({
   >([]);
   const [sessionError, setSessionError] = React.useState<string | null>(null);
   const [showSessions, setShowSessions] = React.useState(false);
+  const [agentMode, setAgentMode] = React.useState(false);
+  // Map from "msgIndex:actionIndex" to result URL (for startAgentServer)
+  const [actionResultUrls, setActionResultUrls] = React.useState<
+    Map<string, string>
+  >(new Map());
 
   // AbortController for cancelling chat requests
   const abortControllerRef = React.useRef<AbortController | null>(null);
@@ -945,6 +960,7 @@ function MynervaComponent({
         setProviders(providersRes.providers);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
+        setAgentMode(providersRes.agentMode ?? false);
         setConfig(cfg);
         setSessions(sessionsRes.sessions);
         setSessionLoadErrors(sessionsRes.errors);
@@ -1070,7 +1086,7 @@ function MynervaComponent({
       }
       case 'listHelp': {
         result = JSON.stringify(
-          { type: 'listHelp', result: buildSystemPrompt() },
+          { type: 'listHelp', result: buildSystemPrompt(agentMode) },
           null,
           2
         );
@@ -1175,8 +1191,33 @@ function MynervaComponent({
         return JSON.stringify({ type: 'deleteCell', result }, null, 2);
       }
       case 'runCell': {
+        if (!agentMode) {
+          return JSON.stringify(
+            {
+              type: 'runCell',
+              error:
+                'Cell execution requires an agent environment. Use startAgentServer first.'
+            },
+            null,
+            2
+          );
+        }
         const result = await contextEngine.runCell(action.query);
         return JSON.stringify({ type: 'runCell', result }, null, 2);
+      }
+      case 'startAgentServer': {
+        const settings = ServerConnection.makeSettings();
+        const url = `${settings.baseUrl}jupyter-mynerva/agent-server`;
+        const resp = await ServerConnection.makeRequest(
+          url,
+          {
+            method: 'POST',
+            body: JSON.stringify({ ssh: action.ssh })
+          },
+          settings
+        );
+        const result = await resp.json();
+        return JSON.stringify({ type: 'startAgentServer', result }, null, 2);
       }
       default:
         return JSON.stringify(
@@ -1246,6 +1287,15 @@ function MynervaComponent({
         null,
         2
       );
+    }
+
+    if (action.type === 'startAgentServer') {
+      const parsed = JSON.parse(result);
+      setActionResultUrls(prev => {
+        const next = new Map(prev);
+        next.set(`${msgIndex}:${actionIndex}`, parsed.result.url);
+        return next;
+      });
     }
 
     setPendingResults(prev => [...prev, result]);
@@ -1439,7 +1489,7 @@ function MynervaComponent({
       setMessages(newMessages);
 
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        { role: 'system' as const, content: buildSystemPrompt(agentMode) },
         ...newMessages
       ];
 
@@ -1533,7 +1583,7 @@ function MynervaComponent({
         setMessages(newMessages);
 
         const chatMessages = [
-          { role: 'system' as const, content: buildSystemPrompt() },
+          { role: 'system' as const, content: buildSystemPrompt(agentMode) },
           ...newMessages
         ];
 
@@ -1576,7 +1626,7 @@ function MynervaComponent({
       setMessages(newMessages);
 
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        { role: 'system' as const, content: buildSystemPrompt(agentMode) },
         ...newMessages
       ];
 
@@ -1633,7 +1683,7 @@ function MynervaComponent({
 
     try {
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        { role: 'system' as const, content: buildSystemPrompt(agentMode) },
         ...newMessages
       ];
       const response = await sendChat(chatMessages, controller.signal);
@@ -1793,6 +1843,7 @@ function MynervaComponent({
           onAcceptAllAlways={handleAcceptAllAlways}
           onRejectAll={handleRejectAll}
           getActionStatus={getActionStatus}
+          actionResultUrls={actionResultUrls}
           loading={loading}
           onCancelLoading={handleCancelLoading}
           hasPendingActions={hasPendingActions}

@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import logging
 import os
@@ -276,7 +277,8 @@ class ProvidersHandler(APIHandler):
             'providers': PROVIDERS,
             'encryption': is_encryption_configured(),
             'defaults': get_default_config(),
-            'filters': filters
+            'filters': filters,
+            'agentMode': bool(os.environ.get('MYNERVA_AGENT_MODE'))
         }))
 
 
@@ -639,6 +641,85 @@ class NblibramHandler(APIHandler):
             self.finish(json.dumps({'output': result.stdout}))
 
 
+class AgentServerHandler(APIHandler):
+    """Start/stop a Named Server for agent isolation via JupyterHub API."""
+
+    def _hub_api(self, method, path, body=None):
+        hub_url = os.environ.get('JUPYTERHUB_API_URL', '')
+        token = os.environ.get('JUPYTERHUB_API_TOKEN', '')
+        if not hub_url or not token:
+            raise RuntimeError('JupyterHub API not available (not running inside JupyterHub)')
+        url = f'{hub_url}{path}'
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header('Authorization', f'token {token}')
+        if data:
+            req.add_header('Content-Type', 'application/json')
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+            if not body:
+                return None
+            return json.loads(body)
+
+    @tornado.web.authenticated
+    async def post(self):
+        data = self.get_json_body()
+        ssh_entries = data.get('ssh', [])
+        host_list = []
+        for entry in ssh_entries:
+            host = entry.get('host', '')
+            try:
+                host_list.append(str(ipaddress.ip_address(host)))
+            except ValueError:
+                self.set_status(400)
+                self.finish(json.dumps({'error': f'Invalid IP address: {host}'}))
+                return
+
+        user = os.environ.get('JUPYTERHUB_USER', '')
+        if not user:
+            self.set_status(500)
+            self.finish(json.dumps({'error': 'Not running inside JupyterHub'}))
+            return
+
+        server_name = 'mynerva-agent'
+        try:
+            # ssh_hosts is passed as user_options → spawner.user_options
+            self._hub_api('POST', f'/users/{user}/servers/{server_name}',
+                          body={'ssh_hosts': host_list})
+        except urllib.error.HTTPError as e:
+            if e.code != 400:  # 400 = already running
+                self.set_status(e.code)
+                self.finish(json.dumps({'error': f'Failed to start server: {e.read().decode()}'}))
+                return
+
+        base_url = os.environ.get('JUPYTERHUB_BASE_URL', '/').rstrip('/')
+        agent_url = f'{base_url}/user/{user}/{server_name}/lab'
+
+        self.finish(json.dumps({
+            'status': 'started',
+            'url': agent_url,
+            'ssh_hosts': host_list
+        }))
+
+    @tornado.web.authenticated
+    async def delete(self):
+        user = os.environ.get('JUPYTERHUB_USER', '')
+        if not user:
+            self.set_status(500)
+            self.finish(json.dumps({'error': 'Not running inside JupyterHub'}))
+            return
+
+        server_name = 'mynerva-agent'
+        try:
+            self._hub_api('DELETE', f'/users/{user}/servers/{server_name}')
+        except urllib.error.HTTPError as e:
+            self.set_status(e.code)
+            self.finish(json.dumps({'error': f'Failed to stop server: {e.read().decode()}'}))
+            return
+
+        self.finish(json.dumps({'status': 'stopped'}))
+
+
 class EnkiGateDeviceFlowHandler(APIHandler):
     @tornado.web.authenticated
     async def post(self):
@@ -694,6 +775,7 @@ def setup_route_handlers(web_app):
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
+    agent_server_pattern = url_path_join(base_url, 'jupyter-mynerva', 'agent-server')
     enki_device_flow_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows')
     enki_device_flow_poll_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows', '([^/]+)', 'poll')
     handlers = [
@@ -703,6 +785,7 @@ def setup_route_handlers(web_app):
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
+        (agent_server_pattern, AgentServerHandler),
         (enki_device_flow_pattern, EnkiGateDeviceFlowHandler),
         (enki_device_flow_poll_pattern, EnkiGateDeviceFlowPollHandler)
     ]
