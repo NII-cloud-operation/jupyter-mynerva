@@ -281,7 +281,7 @@ If default configuration is available, users can choose "Use default settings" i
 
 ## Requirements
 
-- JupyterLab >= 4.0.0
+- JupyterLab >= 4.0.0 or Notebook >= 7.0.0
 - [nblibram](https://github.com/NII-cloud-operation/nblibram) binary in `PATH`
 
 ## Install

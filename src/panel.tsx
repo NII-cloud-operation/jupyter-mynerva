@@ -1,4 +1,4 @@
-import { ILabShell } from '@jupyterlab/application';
+import { JupyterFrontEnd } from '@jupyterlab/application';
 import { ServerConnection } from '@jupyterlab/services';
 import {
   ReactWidget,
@@ -1977,7 +1977,7 @@ export class MynervaPanel extends ReactWidget {
 }
 
 export function activatePanel(
-  shell: ILabShell,
+  shell: JupyterFrontEnd.IShell,
   contextEngine: ContextEngine,
   liveQuery: NblibramLiveQuery
 ): void {
