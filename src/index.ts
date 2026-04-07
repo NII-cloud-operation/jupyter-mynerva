@@ -1,5 +1,4 @@
 import {
-  ILabShell,
   JupyterFrontEnd,
   JupyterFrontEndPlugin
 } from '@jupyterlab/application';
@@ -16,11 +15,10 @@ const plugin: JupyterFrontEndPlugin<void> = {
   description:
     'A JupyterLab extension that provides an LLM-powered assistant with deep understanding of notebook structure.',
   autoStart: true,
-  requires: [ILabShell, INotebookTracker],
+  requires: [INotebookTracker],
   optional: [ISettingRegistry],
   activate: (
     app: JupyterFrontEnd,
-    shell: ILabShell,
     notebookTracker: INotebookTracker,
     settingRegistry: ISettingRegistry | null
   ) => {
@@ -28,7 +26,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
 
     const contextEngine = new ContextEngine(notebookTracker);
     const liveQuery = new NblibramLiveQuery(notebookTracker);
-    activatePanel(shell, contextEngine, liveQuery);
+    activatePanel(app.shell, contextEngine, liveQuery);
 
     if (settingRegistry) {
       settingRegistry
