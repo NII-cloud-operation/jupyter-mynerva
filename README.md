@@ -87,7 +87,7 @@ The LLM actively explores—requesting the table of contents, navigating section
 | Action confirmation | Batch confirmation supported; per-notebook auto-approval available                                 |
 | Mutation validation | Optimistic locking via `_hash`; must read before write                                             |
 | Error handling      | API failure: retry with limit (3). Hash mismatch / user rejection: feedback to LLM, no retry count |
-| LLM providers       | OpenAI, Anthropic, Enki Gate (device flow auth)                                                    |
+| LLM providers       | OpenAI (+ compatible endpoints), Anthropic, Enki Gate (device flow auth)                           |
 
 ### UI
 
@@ -235,17 +235,20 @@ Fernet key for encrypting API keys. If absent, Settings UI shows warning; keys s
 
 Administrators can provide default LLM settings via environment variables. Users can choose to use these defaults or configure their own.
 
-| Variable                    | Description                                                |
-| --------------------------- | ---------------------------------------------------------- |
-| `MYNERVA_OPENAI_API_KEY`    | Default OpenAI API key                                     |
-| `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                  |
-| `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai` or `anthropic`)                 |
-| `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, uses first model if not set) |
+| Variable                    | Description                                                     |
+| --------------------------- | --------------------------------------------------------------- |
+| `MYNERVA_OPENAI_API_KEY`    | Default OpenAI API key                                          |
+| `MYNERVA_OPENAI_BASE_URL`   | Default OpenAI-compatible endpoint (e.g. vLLM, Ollama)          |
+| `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                       |
+| `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai` or `anthropic`)                      |
+| `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, fetched from endpoint if not set) |
 
 **Provider auto-detection:**
 
-- If only one API key is set, that provider is automatically selected
+- If only one API key (or base URL) is set, that provider is automatically selected
 - If both API keys are set, `MYNERVA_DEFAULT_PROVIDER` is required
+- If `MYNERVA_OPENAI_BASE_URL` is set without an API key, the `openai` provider is enabled (for endpoints that don't require authentication)
+- When `MYNERVA_OPENAI_BASE_URL` is set and `MYNERVA_DEFAULT_MODEL` is not, the model list is fetched from the endpoint's `/v1/models`
 
 **Auto-initialization:** If `~/.mynerva/config.json` doesn't exist and defaults are available, it's automatically created with `useDefault: true`.
 
@@ -270,6 +273,7 @@ Users can configure their own settings via the panel settings UI:
 - Provider selection
 - Model selection
 - API key (encrypted if `MYNERVA_SECRET_KEY` is set)
+- Base URL for OpenAI-compatible endpoints (optional)
 - Enki Gate connection (device flow)
 
 If default configuration is available, users can choose "Use default settings" instead of providing their own API key.
@@ -351,6 +355,16 @@ MYNERVA_OPENAI_API_KEY=sk-... MYNERVA_DEFAULT_PROVIDER=openai MYNERVA_DEFAULT_MO
 ```
 
 Users will see a "Use default settings" option in the settings UI.
+
+### Running with an OpenAI-compatible endpoint
+
+Point to a custom endpoint (e.g. vLLM, Ollama):
+
+```bash
+MYNERVA_OPENAI_BASE_URL=http://localhost:8000/v1 jupyter lab
+```
+
+The model list is fetched from the endpoint automatically. Add `MYNERVA_OPENAI_API_KEY` if the endpoint requires authentication.
 
 ### Packaging the extension
 

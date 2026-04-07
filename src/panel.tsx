@@ -1,6 +1,11 @@
 import { ILabShell } from '@jupyterlab/application';
 import { ServerConnection } from '@jupyterlab/services';
-import { ReactWidget, settingsIcon, copyIcon } from '@jupyterlab/ui-components';
+import {
+  ReactWidget,
+  settingsIcon,
+  copyIcon,
+  refreshIcon
+} from '@jupyterlab/ui-components';
 import * as React from 'react';
 import { marked } from 'marked';
 
@@ -40,8 +45,10 @@ interface IConfig {
   provider: string;
   model: string;
   decryptError?: string;
+  configWarning?: string;
   apiKey: string;
   useDefault?: boolean;
+  openaiBaseUrl?: string;
   enkiGateUrl?: string;
   enkiGateToken?: string;
   enkiGateModel?: string;
@@ -51,6 +58,7 @@ interface IConfig {
 interface IDefaultConfig {
   provider: string;
   model: string;
+  openaiBaseUrl?: string;
 }
 
 interface IProvider {
@@ -114,6 +122,31 @@ async function saveConfig(config: IConfig): Promise<void> {
     console.error('Failed to save config', response.status, data);
     throw new Error(data.error || `Failed to save config (${response.status})`);
   }
+}
+
+async function fetchOpenAIModels(
+  baseUrl: string,
+  apiKey: string
+): Promise<string[]> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/openai-models`;
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({ baseUrl, apiKey })
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(
+      data.error || `Failed to fetch models (${response.status})`
+    );
+  }
+  const data = await response.json();
+  return data.models;
 }
 
 interface IChatResponse {
@@ -474,21 +507,75 @@ function SettingsView({
   const [useDefault, setUseDefault] = React.useState(
     defaultsUnavailable ? false : (config.useDefault ?? false)
   );
-  const [provider, setProvider] = React.useState(config.provider);
-  const [model, setModel] = React.useState(config.model);
+  const initialProvider = providers.some(p => p.id === config.provider)
+    ? config.provider
+    : providers[0]?.id || config.provider;
+  const initialModels =
+    providers.find(p => p.id === initialProvider)?.models || [];
+  const [provider, setProvider] = React.useState(initialProvider);
+  const [model, setModel] = React.useState(
+    config.model && initialModels.includes(config.model)
+      ? config.model
+      : initialModels[0] || ''
+  );
   const [apiKey, setApiKey] = React.useState(config.apiKey);
+  const [openaiBaseUrl, setOpenaiBaseUrl] = React.useState(
+    config.openaiBaseUrl || ''
+  );
+  const [customModels, setCustomModels] = React.useState<string[] | null>(null);
+  const [fetchingModels, setFetchingModels] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState('');
 
+  React.useEffect(() => {
+    if (provider === 'openai' && openaiBaseUrl) {
+      setFetchingModels(true);
+      fetchOpenAIModels(openaiBaseUrl, apiKey)
+        .then(fetched => {
+          setCustomModels(fetched);
+          if (!fetched.includes(model)) {
+            setModel(fetched[0]);
+          }
+        })
+        .catch(e => {
+          setError(e instanceof Error ? e.message : 'Failed to fetch models');
+        })
+        .finally(() => setFetchingModels(false));
+    }
+  }, []);
+
   const currentProvider =
     providers.find(p => p.id === provider) || providers[0];
-  const models = currentProvider?.models || [];
+  const models =
+    provider === 'openai' && customModels
+      ? customModels
+      : currentProvider?.models || [];
 
   const handleProviderChange = (newProvider: string) => {
     setProvider(newProvider);
+    setCustomModels(null);
     const newProviderData = providers.find(p => p.id === newProvider);
     if (newProviderData && !newProviderData.models.includes(model)) {
       setModel(newProviderData.models[0] || '');
+    }
+  };
+
+  const handleFetchModels = async () => {
+    if (!openaiBaseUrl) {
+      return;
+    }
+    setFetchingModels(true);
+    setError('');
+    try {
+      const fetched = await fetchOpenAIModels(openaiBaseUrl, apiKey);
+      setCustomModels(fetched);
+      if (!fetched.includes(model)) {
+        setModel(fetched[0]);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to fetch models');
+    } finally {
+      setFetchingModels(false);
     }
   };
 
@@ -496,7 +583,14 @@ function SettingsView({
     setSaving(true);
     setError('');
     try {
-      const newConfig = { provider, model, apiKey, useDefault };
+      const newConfig: IConfig = {
+        provider,
+        model,
+        apiKey,
+        useDefault,
+        openaiBaseUrl:
+          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined
+      };
       await saveConfig(newConfig);
       onSave(newConfig);
     } catch (e) {
@@ -522,7 +616,8 @@ function SettingsView({
               checked={useDefault}
               onChange={e => setUseDefault(e.target.checked)}
             />
-            Use default settings ({defaults.provider} / {defaults.model})
+            Use default settings ({defaults.provider} / {defaults.model}
+            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`})
           </label>
         </div>
       )}
@@ -551,16 +646,17 @@ function SettingsView({
             <EnkiGateSettings config={config} onSave={onSave} />
           ) : (
             <>
-              <div className="jp-Mynerva-settings-field">
-                <label>Model</label>
-                <select value={model} onChange={e => setModel(e.target.value)}>
-                  {models.map(m => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {provider === 'openai' && (
+                <div className="jp-Mynerva-settings-field">
+                  <label>Base URL (optional)</label>
+                  <input
+                    type="text"
+                    value={openaiBaseUrl}
+                    onChange={e => setOpenaiBaseUrl(e.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </div>
+              )}
               <div className="jp-Mynerva-settings-field">
                 <label>API Key</label>
                 <input
@@ -570,11 +666,49 @@ function SettingsView({
                   placeholder="Enter API key"
                 />
               </div>
+              <div className="jp-Mynerva-settings-field">
+                <label>Model</label>
+                <div style={{ display: 'flex', gap: '4px' }}>
+                  <select
+                    value={model}
+                    onChange={e => setModel(e.target.value)}
+                    style={{ flex: 1 }}
+                  >
+                    {models.map(m => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                  {provider === 'openai' && openaiBaseUrl && (
+                    <button
+                      onClick={handleFetchModels}
+                      disabled={fetchingModels}
+                      title="Fetch models from endpoint"
+                      style={{
+                        margin: 0,
+                        padding: '4px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        cursor: fetchingModels ? 'wait' : 'pointer'
+                      }}
+                    >
+                      <refreshIcon.react
+                        tag="span"
+                        width="16px"
+                        height="16px"
+                      />
+                    </button>
+                  )}
+                </div>
+              </div>
             </>
           )}
         </>
       )}
-      {warning && <div className="jp-Mynerva-settings-error">{warning}</div>}
+      {warning && !useDefault && (
+        <div className="jp-Mynerva-settings-error">{warning}</div>
+      )}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
       {provider !== 'enki-gate' && (
         <button
@@ -949,15 +1083,20 @@ function MynervaComponent({
         setSessions(sessionsRes.sessions);
         setSessionLoadErrors(sessionsRes.errors);
 
-        if (cfg.decryptError) {
+        if (cfg.decryptError || cfg.configWarning) {
           setShowSettings(true);
         }
 
         // Show settings if:
-        // - no API key and not using defaults, OR
+        // - no API key (and no base URL) and not using defaults, OR
         // - useDefault is set but defaults are not available
         const defaultsUnavailable = cfg.useDefault && !providersRes.defaults;
-        if ((!cfg.apiKey && !cfg.useDefault) || defaultsUnavailable) {
+        const enkiGateValid =
+          cfg.enkiGateToken &&
+          cfg.enkiGateExpiresAt &&
+          cfg.enkiGateExpiresAt > Date.now();
+        const hasAuth = cfg.apiKey || cfg.openaiBaseUrl || enkiGateValid;
+        if ((!hasAuth && !cfg.useDefault) || defaultsUnavailable) {
           setShowSettings(true);
         }
       })
@@ -1780,7 +1919,7 @@ function MynervaComponent({
           defaults={defaults}
           defaultsUnavailable={!!(config?.useDefault && !defaults)}
           onSave={handleConfigSave}
-          warning={config?.decryptError}
+          warning={config?.configWarning || config?.decryptError}
         />
       ) : (
         <ChatView

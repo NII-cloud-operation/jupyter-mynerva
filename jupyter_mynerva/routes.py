@@ -133,6 +133,9 @@ if 'MYNERVA_DEFAULT_PROVIDER' in os.environ:
 if 'MYNERVA_DEFAULT_MODEL' in os.environ:
     _DEFAULT_CONFIG['model'] = os.environ['MYNERVA_DEFAULT_MODEL']
 
+if 'MYNERVA_OPENAI_BASE_URL' in os.environ:
+    _DEFAULT_CONFIG['openai_base_url'] = os.environ['MYNERVA_OPENAI_BASE_URL']
+
 
 def _get_provider_models(provider_id):
     """Returns model list for the given provider."""
@@ -142,14 +145,33 @@ def _get_provider_models(provider_id):
     return []
 
 
+_openai_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
+
+
+def _fetch_openai_models(api_key, base_url):
+    """Fetch model list from an OpenAI-compatible v1/models endpoint."""
+    cache_key = base_url
+    if cache_key in _openai_models_cache:
+        return _openai_models_cache[cache_key]
+    client = OpenAI(api_key=api_key or '', base_url=base_url)
+    response = client.models.list()
+    models = sorted([m.id for m in response.data])
+    if not models:
+        raise ValueError(f'No models available from {base_url}')
+    _openai_models_cache[cache_key] = models
+    return models
+
+
 def get_default_config():
     """Returns default config if available.
 
-    - If only one API key is set, auto-select that provider
+    - If only one API key (or base_url) is set, auto-select that provider
     - If both API keys are set, MYNERVA_DEFAULT_PROVIDER is required
     - If model is not specified, use first model from provider's list
+      (fetched from v1/models when openai_base_url is set)
     """
-    has_openai = bool(_DEFAULT_CONFIG.get('openai_api_key'))
+    has_openai = bool(_DEFAULT_CONFIG.get('openai_api_key') or
+                      _DEFAULT_CONFIG.get('openai_base_url'))
     has_anthropic = bool(_DEFAULT_CONFIG.get('anthropic_api_key'))
 
     if not has_openai and not has_anthropic:
@@ -170,13 +192,24 @@ def get_default_config():
     # Determine model
     model = _DEFAULT_CONFIG.get('model')
     if not model:
-        models = _get_provider_models(provider)
-        model = models[0] if models else ''
+        if provider == 'openai' and _DEFAULT_CONFIG.get('openai_base_url'):
+            base_url = _DEFAULT_CONFIG['openai_base_url']
+            models = _fetch_openai_models(
+                _DEFAULT_CONFIG.get('openai_api_key'), base_url)
+            model = models[0]
+            _log.info('Fetched %d models from %s, using %s',
+                      len(models), base_url, model)
+        else:
+            models = _get_provider_models(provider)
+            model = models[0] if models else ''
 
-    return {
+    result = {
         'provider': provider,
         'model': model,
     }
+    if _DEFAULT_CONFIG.get('openai_base_url'):
+        result['openaiBaseUrl'] = _DEFAULT_CONFIG['openai_base_url']
+    return result
 
 
 def get_default_api_key(provider):
@@ -186,6 +219,28 @@ def get_default_api_key(provider):
     elif provider == 'anthropic':
         return _DEFAULT_CONFIG.get('anthropic_api_key')
     return None
+
+
+def resolve_chat_config(config):
+    """Resolve provider, model, api_key, base_url from config.
+
+    All fields come from the same source (defaults or user config)
+    to prevent credential leakage across trust boundaries.
+    """
+    if config.get('useDefault'):
+        defaults = get_default_config()
+        if not defaults:
+            raise ValueError('Default configuration not available')
+        provider = defaults['provider']
+        model = defaults['model']
+        api_key = get_default_api_key(provider)
+        base_url = _DEFAULT_CONFIG.get('openai_base_url')
+    else:
+        provider = config['provider']
+        model = config['model']
+        api_key = config.get('apiKey')
+        base_url = config.get('openaiBaseUrl')
+    return provider, model, api_key, base_url
 
 
 def get_fernet():
@@ -226,6 +281,14 @@ def load_config():
     if config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
+        # Validate required fields (only when not using defaults)
+        if not config.get('useDefault'):
+            missing = [f for f in ('provider', 'model') if f not in config]
+            if missing:
+                _log.warning('Config missing required fields: %s', ', '.join(missing))
+                config['provider'] = DEFAULT_PROVIDER
+                config['model'] = DEFAULT_MODEL
+                config['configWarning'] = f'Config missing required fields: {", ".join(missing)}'
         try:
             config['apiKey'] = decrypt_api_key(config.get('apiKey', ''))
         except ValueError:
@@ -294,7 +357,7 @@ class ConfigHandler(APIHandler):
 
 
 def chat_openai(api_key, model, messages, base_url=None):
-    kwargs = {'api_key': api_key}
+    kwargs = {'api_key': api_key or ''}
     if base_url:
         kwargs['base_url'] = base_url
     client = OpenAI(**kwargs)
@@ -341,20 +404,9 @@ class ChatHandler(APIHandler):
         messages = data.get('messages', [])
 
         config = load_config()
-
-        if config.get('useDefault'):
-            defaults = get_default_config()
-            if not defaults:
-                self.set_status(500)
-                self.finish(json.dumps({'error': 'Default configuration not available'}))
-                return
-            provider = defaults['provider']
-            model = defaults['model']
-            api_key = get_default_api_key(provider)
-        else:
-            provider = config.get('provider', DEFAULT_PROVIDER)
-            model = config.get('model', DEFAULT_MODEL)
-            api_key = config.get('apiKey')
+        provider, model, api_key, base_url = resolve_chat_config(config)
+        self.log.info('Chat request: provider=%s, model=%s, base_url=%s',
+                      provider, model, base_url)
 
         if provider == 'echo':
             result = chat_echo(messages)
@@ -374,14 +426,17 @@ class ChatHandler(APIHandler):
             self.finish(json.dumps(result))
             return
 
-        if not api_key:
-            self.set_status(500)
-            self.finish(json.dumps({'error': 'API key not configured'}))
-            return
-
         if provider == 'openai':
-            result = chat_openai(api_key, model, messages)
+            if not api_key and not base_url:
+                self.set_status(500)
+                self.finish(json.dumps({'error': 'API key not configured'}))
+                return
+            result = chat_openai(api_key, model, messages, base_url=base_url)
         elif provider == 'anthropic':
+            if not api_key:
+                self.set_status(500)
+                self.finish(json.dumps({'error': 'API key not configured'}))
+                return
             result = chat_anthropic(api_key, model, messages)
         else:
             self.set_status(400)
@@ -684,6 +739,16 @@ class EnkiGateDeviceFlowPollHandler(APIHandler):
             self.finish(json.dumps({'error': e.read().decode()}))
 
 
+class OpenAIModelsHandler(APIHandler):
+    @tornado.web.authenticated
+    def post(self):
+        data = self.get_json_body()
+        base_url = data.get('baseUrl')
+        api_key = data.get('apiKey')
+        models = _fetch_openai_models(api_key, base_url)
+        self.finish(json.dumps({'models': models}))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -691,6 +756,7 @@ def setup_route_handlers(web_app):
     providers_pattern = url_path_join(base_url, 'jupyter-mynerva', 'providers')
     config_pattern = url_path_join(base_url, 'jupyter-mynerva', 'config')
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
+    openai_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'openai-models')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -700,6 +766,7 @@ def setup_route_handlers(web_app):
         (providers_pattern, ProvidersHandler),
         (config_pattern, ConfigHandler),
         (chat_pattern, ChatHandler),
+        (openai_models_pattern, OpenAIModelsHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
