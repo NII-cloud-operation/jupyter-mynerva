@@ -645,3 +645,37 @@
 .jp-Mynerva-session-errors > div:last-child {
   margin-bottom: 0;
 }
+
+/* Streaming status indicators */
+.jp-Mynerva-streaming-status {
+  color: var(--jp-ui-font-color2);
+  font-style: italic;
+  animation: jp-mynerva-pulse 1.5s ease-in-out infinite;
+}
+
+.jp-Mynerva-reasoning {
+  color: var(--jp-ui-font-color2);
+  font-size: 0.85em;
+  font-style: italic;
+  border-left: 2px solid var(--jp-border-color1);
+  padding-left: 8px;
+  margin-bottom: 8px;
+}
+
+@keyframes jp-mynerva-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.jp-Mynerva-stop-warning {
+  color: var(--jp-warn-color1);
+  font-size: 0.85em;
+  font-style: italic;
+  margin-top: 4px;
+}

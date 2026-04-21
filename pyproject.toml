@@ -81,7 +81,10 @@ before-build-npm = [
 before-build-python = ["jlpm clean:all"]
 
 [project.optional-dependencies]
-test = ["pytest>=7.0"]
+test = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.check-wheel-contents]
 ignore = ["W002"]
