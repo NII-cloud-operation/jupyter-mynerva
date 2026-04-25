@@ -24,11 +24,29 @@ except ImportError:
 from jupyter_server.base.handlers import APIHandler
 from jupyter_server.utils import url_path_join
 import tornado
-from openai import OpenAI
-from anthropic import Anthropic
-from cryptography.fernet import Fernet
 
 from .echo_agent import chat_echo
+
+
+# Lazy import wrappers for heavy SDKs. The actual modules are loaded only on
+# first call, keeping `import jupyter_mynerva` fast (avoids ~1-3s of openai /
+# anthropic / pydantic / cryptography import time during JupyterHub spawn).
+# unittest.mock.patch('jupyter_mynerva.routes.OpenAI', ...) replaces the
+# wrapper with a Mock, so existing tests keep working.
+
+def OpenAI(*args, **kwargs):
+    from openai import OpenAI as _OpenAI
+    return _OpenAI(*args, **kwargs)
+
+
+def Anthropic(*args, **kwargs):
+    from anthropic import Anthropic as _Anthropic
+    return _Anthropic(*args, **kwargs)
+
+
+def Fernet(*args, **kwargs):
+    from cryptography.fernet import Fernet as _Fernet
+    return _Fernet(*args, **kwargs)
 
 
 PROVIDERS = [
