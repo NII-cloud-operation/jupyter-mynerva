@@ -4,8 +4,9 @@
     https://jupyterlab.readthedocs.io/en/stable/developer/css.html
 */
 
-/* Streamdown CSS variables (shadcn/ui design tokens) */
-:root {
+/* Streamdown CSS variables (shadcn/ui design tokens). Scoped to the
+   Streamdown wrapper so they don't leak to the rest of JupyterLab. */
+.jp-Mynerva-streamdown {
   --background: 0 0% 100%;
   --foreground: 0 0% 3.9%;
   --muted: 0 0% 96.1%;

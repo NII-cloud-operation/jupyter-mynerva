@@ -39,9 +39,14 @@ def OpenAI(*args, **kwargs):
     return _OpenAI(*args, **kwargs)
 
 
-def Anthropic(*args, **kwargs):
-    from anthropic import Anthropic as _Anthropic
-    return _Anthropic(*args, **kwargs)
+def AsyncOpenAI(*args, **kwargs):
+    from openai import AsyncOpenAI as _AsyncOpenAI
+    return _AsyncOpenAI(*args, **kwargs)
+
+
+def AsyncAnthropic(*args, **kwargs):
+    from anthropic import AsyncAnthropic as _AsyncAnthropic
+    return _AsyncAnthropic(*args, **kwargs)
 
 
 def Fernet(*args, **kwargs):
@@ -483,15 +488,15 @@ async def chat_openai(handler, api_key, model, messages, base_url=None):
     kwargs = {'api_key': api_key or ''}
     if base_url:
         kwargs['base_url'] = base_url
-    client = OpenAI(**kwargs)
+    client = AsyncOpenAI(**kwargs)
 
     api_input = _convert_messages_for_responses_api(messages)
     text_accumulated = ''
 
-    stream = client.responses.create(
+    stream = await client.responses.create(
         model=model, input=api_input, stream=True
     )
-    for event in stream:
+    async for event in stream:
         if event.type == 'response.in_progress':
             _block_start(handler, 'thinking')
 
@@ -553,8 +558,9 @@ def _build_anthropic_params(messages):
             api_messages.append({'role': role, 'content': content})
 
     kwargs = {
-        'max_tokens': 4096,
-        'messages': api_messages
+        'max_tokens': 32000,
+        'messages': api_messages,
+        'thinking': {'type': 'enabled', 'budget_tokens': 2000}
     }
     if system_text:
         kwargs['system'] = system_text
@@ -564,14 +570,15 @@ def _build_anthropic_params(messages):
 @sse_serializer
 async def chat_anthropic(handler, api_key, model, messages):
     """Serializer for Anthropic messages.stream API."""
-    client = Anthropic(api_key=api_key)
+    client = AsyncAnthropic(api_key=api_key)
     kwargs = _build_anthropic_params(messages)
 
-    with client.messages.stream(model=model, **kwargs) as stream:
+    text_accumulated = ''
+    async with client.messages.stream(model=model, **kwargs) as stream:
         # Anthropic の content_block.type は Mynerva の content_type と一致する
         # サポート対象: 'thinking', 'text'
         current_block_type = ''
-        for event in stream:
+        async for event in stream:
             if event.type == 'content_block_start':
                 block_type = event.content_block.type
                 if block_type in ('thinking', 'text'):
@@ -583,15 +590,18 @@ async def chat_anthropic(handler, api_key, model, messages):
                 if delta.type == 'thinking_delta':
                     _block_delta(handler, 'thinking', delta.thinking)
                 elif delta.type == 'text_delta':
-                    _block_delta(handler, 'text', delta.text)
+                    text_accumulated += delta.text
+                    display = _extract_json_content(text_accumulated)
+                    if display:
+                        _block_delta(handler, 'text', display)
 
             elif event.type == 'content_block_stop':
                 if current_block_type:
                     _block_stop(handler, current_block_type)
                     current_block_type = ''
 
-        final_msg = stream.get_final_message()
-        final_text = stream.get_final_text()
+        final_msg = await stream.get_final_message()
+        final_text = await stream.get_final_text()
         stop_reason = getattr(final_msg, 'stop_reason', 'end_turn')
         _send_sse(handler, {'type': 'message_done',
                             'text': final_text,
