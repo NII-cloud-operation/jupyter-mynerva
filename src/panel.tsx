@@ -1054,7 +1054,14 @@ function ChatView({
                 <div className="jp-Mynerva-streaming-status">Generating...</div>
               )}
               {streamingContent ? (
-                <Streamdown animated>{streamingContent}</Streamdown>
+                <div className="jp-Mynerva-streamdown">
+                  <Streamdown
+                    animated
+                    controls={{ code: false, table: false, mermaid: false }}
+                  >
+                    {streamingContent}
+                  </Streamdown>
+                </div>
               ) : (
                 !activeContentType && '...'
               )}

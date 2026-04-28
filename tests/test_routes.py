@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from cryptography.fernet import Fernet
@@ -380,6 +380,42 @@ def _parse_sse_payloads(handler):
     return payloads, written
 
 
+# --- async helpers for streaming mocks ---
+
+def _async_iter(items):
+    """Wrap a sync iterable so it can be consumed via `async for`."""
+    async def _gen():
+        for item in items:
+            yield item
+    return _gen()
+
+
+class _AsyncStreamCtx:
+    """Async context manager that yields events from a list and exposes
+    Anthropic's async final-state methods (get_final_message/text)."""
+    def __init__(self, events, final_text='', stop_reason='end_turn'):
+        self._events = list(events)
+        self._final_text = final_text
+        self._stop_reason = stop_reason
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return _async_iter(self._events)
+
+    async def get_final_text(self):
+        return self._final_text
+
+    async def get_final_message(self):
+        msg = MagicMock()
+        msg.stop_reason = self._stop_reason
+        return msg
+
+
 # --- chat_openai ---
 
 def _make_event(event_type, **kwargs):
@@ -407,8 +443,8 @@ async def test_chat_openai_basic_flow():
         _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [])
 
     payloads, written = _parse_sse_payloads(handler)
@@ -453,8 +489,8 @@ async def test_chat_openai_reasoning():
         _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -470,8 +506,8 @@ async def test_chat_openai_reasoning():
 async def test_chat_openai_api_error():
     handler = MagicMock()
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.side_effect = Exception('API key invalid')
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(side_effect=Exception('API key invalid'))
         await chat_openai(handler, 'bad-key', 'gpt-4o', [])
 
     payloads, written = _parse_sse_payloads(handler)
@@ -491,8 +527,8 @@ async def test_chat_openai_failed_event():
         _make_event('response.failed', error='rate limit exceeded'),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -513,8 +549,8 @@ async def test_chat_openai_system_role_converted():
         _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', messages)
 
     call_kwargs = MockOpenAI.return_value.responses.create.call_args
@@ -531,8 +567,8 @@ async def test_chat_openai_with_base_url():
         _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [],
                                  base_url='http://custom/v1')
 
@@ -558,7 +594,8 @@ def test_build_anthropic_params_no_system():
     messages = [{'role': 'user', 'content': 'Hi'}]
     params = _build_anthropic_params(messages)
     assert 'system' not in params
-    assert params['max_tokens'] == 4096
+    assert params['max_tokens'] == 32000
+    assert params['thinking'] == {'type': 'enabled', 'budget_tokens': 2000}
 
 
 # --- chat_anthropic ---
@@ -590,28 +627,26 @@ def _make_delta(delta_type, **kwargs):
 @pytest.mark.asyncio
 async def test_chat_anthropic_basic_flow():
     handler = MagicMock()
+    # chat_anthropic extracts the content field from a Mynerva JSON envelope,
+    # so the mocked text deltas form a partial JSON that resolves to "Hello world".
+    json_text = '{"messages":[{"role":"assistant","content":"Hello world"}],"actions":[]}'
     events = [
         _make_anthropic_event('content_block_start',
                               content_block=_make_content_block('text')),
         _make_anthropic_event('content_block_delta',
-                              delta=_make_delta('text_delta', text='Hello')),
+                              delta=_make_delta('text_delta',
+                                                text='{"messages":[{"role":"assistant","content":"Hello')),
         _make_anthropic_event('content_block_delta',
-                              delta=_make_delta('text_delta', text=' world')),
+                              delta=_make_delta('text_delta',
+                                                text=' world"}],"actions":[]}')),
         _make_anthropic_event('content_block_stop'),
         _make_anthropic_event('message_stop'),
     ]
 
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.__iter__ = MagicMock(return_value=iter(events))
-    mock_stream.get_final_text = MagicMock(return_value='Hello world')
-    final_msg = MagicMock()
-    final_msg.stop_reason = 'end_turn'
-    mock_stream.get_final_message = MagicMock(return_value=final_msg)
-
-    with patch('jupyter_mynerva.routes.Anthropic') as MockAnthropic:
-        MockAnthropic.return_value.messages.stream.return_value = mock_stream
+    mock_stream = _AsyncStreamCtx(events, final_text=json_text,
+                                  stop_reason='end_turn')
+    with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
+        MockAnthropic.return_value.messages.stream = MagicMock(return_value=mock_stream)
         await chat_anthropic(handler, 'key', 'claude-sonnet', [])
 
     payloads, written = _parse_sse_payloads(handler)
@@ -622,13 +657,14 @@ async def test_chat_anthropic_basic_flow():
     assert 'content_block_stop' in types
     assert 'message_done' in types
 
+    # _extract_json_content emits accumulated content (cumulative, not incremental)
     text_deltas = [p for p in payloads
                    if p['type'] == 'content_block_delta' and p['content_type'] == 'text']
     assert text_deltas[0]['delta'] == 'Hello'
-    assert text_deltas[1]['delta'] == ' world'
+    assert text_deltas[1]['delta'] == 'Hello world'
 
     done = [p for p in payloads if p['type'] == 'message_done']
-    assert done[0]['text'] == 'Hello world'
+    assert done[0]['text'] == json_text
     assert done[0]['stop_reason'] == 'end_turn'
 
     assert written[-1] == 'data: [DONE]\n\n'
@@ -651,14 +687,10 @@ async def test_chat_anthropic_thinking():
         _make_anthropic_event('content_block_stop'),
     ]
 
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.__iter__ = MagicMock(return_value=iter(events))
-    mock_stream.get_final_text = MagicMock(return_value='Answer')
-
-    with patch('jupyter_mynerva.routes.Anthropic') as MockAnthropic:
-        MockAnthropic.return_value.messages.stream.return_value = mock_stream
+    mock_stream = _AsyncStreamCtx(events, final_text='Answer',
+                                  stop_reason='end_turn')
+    with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
+        MockAnthropic.return_value.messages.stream = MagicMock(return_value=mock_stream)
         await chat_anthropic(handler, 'key', 'claude-opus', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -680,8 +712,8 @@ async def test_chat_anthropic_thinking():
 async def test_chat_anthropic_api_error():
     handler = MagicMock()
 
-    with patch('jupyter_mynerva.routes.Anthropic') as MockAnthropic:
-        MockAnthropic.return_value.messages.stream.side_effect = Exception('Auth failed')
+    with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
+        MockAnthropic.return_value.messages.stream = MagicMock(side_effect=Exception('Auth failed'))
         await chat_anthropic(handler, 'bad-key', 'claude-sonnet', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -708,8 +740,8 @@ async def test_chat_openai_stop_reason():
         _make_event('response.completed', response=completed_response),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -733,8 +765,8 @@ async def test_chat_openai_stop_reason_incomplete():
         _make_event('response.completed', response=completed_response),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -754,8 +786,8 @@ async def test_chat_openai_reasoning_done():
         _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
     ]
 
-    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
-        MockOpenAI.return_value.responses.create.return_value = events
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
         await chat_openai(handler, 'key', 'gpt-4o', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -776,18 +808,10 @@ async def test_chat_anthropic_stop_reason():
         _make_anthropic_event('content_block_stop'),
     ]
 
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.__iter__ = MagicMock(return_value=iter(events))
-    mock_stream.get_final_text = MagicMock(return_value='Hi')
-
-    final_msg = MagicMock()
-    final_msg.stop_reason = 'max_tokens'
-    mock_stream.get_final_message = MagicMock(return_value=final_msg)
-
-    with patch('jupyter_mynerva.routes.Anthropic') as MockAnthropic:
-        MockAnthropic.return_value.messages.stream.return_value = mock_stream
+    mock_stream = _AsyncStreamCtx(events, final_text='Hi',
+                                  stop_reason='max_tokens')
+    with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
+        MockAnthropic.return_value.messages.stream = MagicMock(return_value=mock_stream)
         await chat_anthropic(handler, 'key', 'claude-sonnet', [])
 
     payloads, _ = _parse_sse_payloads(handler)
@@ -910,17 +934,10 @@ async def test_chat_anthropic_unknown_block_type_ignored():
         _make_anthropic_event('content_block_stop'),
     ]
 
-    mock_stream = MagicMock()
-    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-    mock_stream.__exit__ = MagicMock(return_value=False)
-    mock_stream.__iter__ = MagicMock(return_value=iter(events))
-    mock_stream.get_final_text = MagicMock(return_value='ok')
-    final_msg = MagicMock()
-    final_msg.stop_reason = 'end_turn'
-    mock_stream.get_final_message = MagicMock(return_value=final_msg)
-
-    with patch('jupyter_mynerva.routes.Anthropic') as MockAnthropic:
-        MockAnthropic.return_value.messages.stream.return_value = mock_stream
+    mock_stream = _AsyncStreamCtx(events, final_text='ok',
+                                  stop_reason='end_turn')
+    with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
+        MockAnthropic.return_value.messages.stream = MagicMock(return_value=mock_stream)
         await chat_anthropic(handler, 'key', 'claude-sonnet', [])
 
     payloads, _ = _parse_sse_payloads(handler)
