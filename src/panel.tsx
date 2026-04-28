@@ -8,6 +8,7 @@ import {
 } from '@jupyterlab/ui-components';
 import * as React from 'react';
 import { marked } from 'marked';
+import { Streamdown } from 'streamdown';
 
 import { ContextEngine } from './context';
 import {
@@ -150,27 +151,22 @@ async function fetchOpenAIModels(
   return data.models;
 }
 
-interface IChatResponse {
-  provider: string;
-  response: Record<string, unknown>;
-}
-
-function parseAssistantContent(data: IChatResponse): string {
-  const { provider, response } = data;
-  if (provider === 'openai') {
-    const choices = response.choices as Array<{
-      message?: { content?: string };
-    }>;
-    return choices?.[0]?.message?.content || JSON.stringify(response);
-  } else if (provider === 'anthropic') {
-    const content = response.content as Array<{ text?: string }>;
-    return content?.[0]?.text || JSON.stringify(response);
-  }
-  return JSON.stringify(response);
+interface IStreamCallbacks {
+  onContentBlockStart: (
+    contentType: string,
+    metadata?: Record<string, unknown>
+  ) => void;
+  onContentBlockDelta: (contentType: string, delta: string) => void;
+  onContentBlockStop: (
+    contentType: string,
+    metadata?: Record<string, unknown>
+  ) => void;
+  onMessageDone: (text: string, stopReason?: string) => void;
 }
 
 async function sendChat(
   messages: IMessage[],
+  callbacks: IStreamCallbacks,
   signal?: AbortSignal
 ): Promise<string> {
   const settings = ServerConnection.makeSettings();
@@ -188,12 +184,61 @@ async function sendChat(
 
   if (!response.ok) {
     const data = await response.json();
-    console.error('Chat request failed', response.status, data);
     throw new Error(data.error || `Request failed (${response.status})`);
   }
 
-  const data: IChatResponse = await response.json();
-  return parseAssistantContent(data);
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let doneText = '';
+  let buffer = '';
+  let reading = true;
+
+  while (reading) {
+    const { done, value } = await reader.read();
+    if (done) {
+      reading = false;
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data: ')) {
+        continue;
+      }
+      const payload = trimmed.slice(6);
+      if (payload === '[DONE]') {
+        return doneText;
+      }
+      try {
+        const parsed = JSON.parse(payload);
+
+        if (parsed.type === 'error') {
+          throw new Error(parsed.error);
+        } else if (parsed.type === 'content_block_start') {
+          callbacks.onContentBlockStart(parsed.content_type, parsed);
+        } else if (parsed.type === 'content_block_delta') {
+          callbacks.onContentBlockDelta(parsed.content_type, parsed.delta);
+        } else if (parsed.type === 'content_block_stop') {
+          callbacks.onContentBlockStop(parsed.content_type, parsed);
+        } else if (parsed.type === 'message_done') {
+          doneText = parsed.text;
+          callbacks.onMessageDone(parsed.text, parsed.stop_reason);
+        }
+      } catch (e) {
+        if (e instanceof SyntaxError) {
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+
+  return doneText;
 }
 
 function humanizeTime(isoString: string): string {
@@ -799,6 +844,10 @@ interface IChatViewProps {
   onRejectAll: (msgIndex: number) => void;
   getActionStatus: (msgIndex: number, actionIndex: number) => ActionStatus;
   loading: boolean;
+  streamingContent: string;
+  activeContentType: string;
+  thinkingContent: string;
+  stopReason: string;
   onCancelLoading: () => void;
   hasPendingActions: boolean;
   filterEnabled: boolean;
@@ -825,6 +874,10 @@ function ChatView({
   onRejectAll,
   getActionStatus,
   loading,
+  streamingContent,
+  activeContentType,
+  thinkingContent,
+  stopReason,
   onCancelLoading,
   hasPendingActions,
   filterEnabled,
@@ -837,7 +890,7 @@ function ChatView({
 
   React.useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading]);
+  }, [messages, loading, streamingContent]);
 
   React.useEffect(() => {
     if (!loading && !hasPendingActions) {
@@ -986,7 +1039,39 @@ function ChatView({
         })}
         {loading && (
           <div className="jp-Mynerva-message jp-Mynerva-assistant">
-            <div className="jp-Mynerva-message-content">...</div>
+            <div className="jp-Mynerva-message-content">
+              {activeContentType === 'thinking' && !streamingContent && (
+                <div className="jp-Mynerva-streaming-status">
+                  Thinking...
+                  {thinkingContent && (
+                    <div className="jp-Mynerva-reasoning">
+                      {thinkingContent}
+                    </div>
+                  )}
+                </div>
+              )}
+              {activeContentType === 'text' && !streamingContent && (
+                <div className="jp-Mynerva-streaming-status">Generating...</div>
+              )}
+              {streamingContent ? (
+                <div className="jp-Mynerva-streamdown">
+                  <Streamdown
+                    animated
+                    controls={{ code: false, table: false, mermaid: false }}
+                  >
+                    {streamingContent}
+                  </Streamdown>
+                </div>
+              ) : (
+                !activeContentType && '...'
+              )}
+              {stopReason &&
+                (stopReason === 'max_tokens' || stopReason === 'length') && (
+                  <div className="jp-Mynerva-stop-warning">
+                    Response was truncated (max tokens reached)
+                  </div>
+                )}
+            </div>
           </div>
         )}
         <div ref={messagesEndRef} />
@@ -1051,6 +1136,10 @@ function MynervaComponent({
   const [showSettings, setShowSettings] = React.useState(false);
   const [messages, setMessages] = React.useState<IMessage[]>([]);
   const [loading, setLoading] = React.useState(false);
+  const [streamingContent, setStreamingContent] = React.useState('');
+  const [activeContentType, setActiveContentType] = React.useState('');
+  const [thinkingContent, setThinkingContent] = React.useState('');
+  const [stopReason, setStopReason] = React.useState('');
   const [initializing, setInitializing] = React.useState(true);
   const [initError, setInitError] = React.useState<string | null>(null);
   const [filterEnabled, setFilterEnabled] = React.useState(true);
@@ -1590,7 +1679,7 @@ function MynervaComponent({
       ];
 
       try {
-        const response = await sendChat(chatMessages);
+        const response = await runChat(chatMessages);
         const finalMessages = await processLLMResponse(
           response,
           newMessages,
@@ -1604,6 +1693,7 @@ function MynervaComponent({
         };
         setMessages(prev => [...prev, errorMessage]);
       } finally {
+        clearStreamingState();
         setLoading(false);
       }
     };
@@ -1650,6 +1740,51 @@ function MynervaComponent({
     }
   }, [messages, autoApproved, fileAutoApproved]);
 
+  const clearStreamingState = () => {
+    setStreamingContent('');
+    setActiveContentType('');
+    setThinkingContent('');
+    setStopReason('');
+  };
+
+  const runChat = async (
+    chatMessages: IMessage[],
+    signal?: AbortSignal
+  ): Promise<string> => {
+    clearStreamingState();
+    try {
+      return await sendChat(
+        chatMessages,
+        {
+          onContentBlockStart: (ct: string) => setActiveContentType(ct),
+          onContentBlockDelta: (ct: string, delta: string) => {
+            if (ct === 'text') {
+              setStreamingContent(delta);
+            } else if (ct === 'thinking') {
+              setThinkingContent(prev => prev + delta);
+            }
+          },
+          onContentBlockStop: (
+            ct: string,
+            metadata?: Record<string, unknown>
+          ) => {
+            if (ct === 'thinking' && metadata?.text) {
+              setThinkingContent(metadata.text as string);
+            }
+          },
+          onMessageDone: (_text: string, reason?: string) => {
+            if (reason) {
+              setStopReason(reason);
+            }
+          }
+        },
+        signal
+      );
+    } finally {
+      clearStreamingState();
+    }
+  };
+
   const processLLMResponse = async (
     rawContent: string,
     currentMessages: IMessage[],
@@ -1683,7 +1818,7 @@ function MynervaComponent({
           ...newMessages
         ];
 
-        const nextResponse = await sendChat(chatMessages, signal);
+        const nextResponse = await runChat(chatMessages, signal);
         return processLLMResponse(
           nextResponse,
           newMessages,
@@ -1726,7 +1861,7 @@ function MynervaComponent({
         ...newMessages
       ];
 
-      const nextResponse = await sendChat(chatMessages, signal);
+      const nextResponse = await runChat(chatMessages, signal);
       return processLLMResponse(
         nextResponse,
         newMessages,
@@ -1750,6 +1885,7 @@ function MynervaComponent({
     abortControllerRef.current = null;
     // Remove the last user message
     setMessages(prev => prev.slice(0, -1));
+    clearStreamingState();
     setLoading(false);
   };
 
@@ -1782,7 +1918,8 @@ function MynervaComponent({
         { role: 'system' as const, content: buildSystemPrompt() },
         ...newMessages
       ];
-      const response = await sendChat(chatMessages, controller.signal);
+
+      const response = await runChat(chatMessages, controller.signal);
       const finalMessages = await processLLMResponse(
         response,
         newMessages,
@@ -1801,6 +1938,7 @@ function MynervaComponent({
       setMessages(prev => [...prev, errorMessage]);
     } finally {
       abortControllerRef.current = null;
+      clearStreamingState();
       setLoading(false);
     }
   };
@@ -1942,6 +2080,10 @@ function MynervaComponent({
           onRejectAll={handleRejectAll}
           getActionStatus={getActionStatus}
           loading={loading}
+          streamingContent={streamingContent}
+          activeContentType={activeContentType}
+          thinkingContent={thinkingContent}
+          stopReason={stopReason}
           onCancelLoading={handleCancelLoading}
           hasPendingActions={hasPendingActions}
           filterEnabled={filterEnabled}

@@ -60,7 +60,8 @@
         "@jupyterlab/services": "^7.0.0",
         "@jupyterlab/settingregistry": "^4.0.0",
         "@jupyterlab/ui-components": "^4.0.0",
-        "marked": "^17.0.1"
+        "marked": "^17.0.1",
+        "streamdown": "^2.5.0"
     },
     "devDependencies": {
         "@jupyterlab/builder": "^4.0.0",

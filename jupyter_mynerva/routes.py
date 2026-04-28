@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import os
@@ -23,11 +24,34 @@ except ImportError:
 from jupyter_server.base.handlers import APIHandler
 from jupyter_server.utils import url_path_join
 import tornado
-from openai import OpenAI
-from anthropic import Anthropic
-from cryptography.fernet import Fernet
 
 from .echo_agent import chat_echo
+
+
+# Lazy import wrappers for heavy SDKs. The actual modules are loaded only on
+# first call, keeping `import jupyter_mynerva` fast (avoids ~1-3s of openai /
+# anthropic / pydantic / cryptography import time during JupyterHub spawn).
+# unittest.mock.patch('jupyter_mynerva.routes.OpenAI', ...) replaces the
+# wrapper with a Mock, so existing tests keep working.
+
+def OpenAI(*args, **kwargs):
+    from openai import OpenAI as _OpenAI
+    return _OpenAI(*args, **kwargs)
+
+
+def AsyncOpenAI(*args, **kwargs):
+    from openai import AsyncOpenAI as _AsyncOpenAI
+    return _AsyncOpenAI(*args, **kwargs)
+
+
+def AsyncAnthropic(*args, **kwargs):
+    from anthropic import AsyncAnthropic as _AsyncAnthropic
+    return _AsyncAnthropic(*args, **kwargs)
+
+
+def Fernet(*args, **kwargs):
+    from cryptography.fernet import Fernet as _Fernet
+    return _Fernet(*args, **kwargs)
 
 
 PROVIDERS = [
@@ -362,18 +386,160 @@ class ConfigHandler(APIHandler):
         self.finish(json.dumps({'status': 'ok'}))
 
 
-def chat_openai(api_key, model, messages, base_url=None):
+def _init_sse(handler):
+    """Set SSE response headers."""
+    handler.set_header('Content-Type', 'text/event-stream')
+    handler.set_header('Cache-Control', 'no-cache')
+    handler.set_header('Connection', 'keep-alive')
+
+
+def _send_sse(handler, data):
+    """Send a single SSE event."""
+    handler.write(f'data: {json.dumps(data)}\n\n')
+    handler.flush()
+
+
+def _finish_sse(handler):
+    """Send SSE termination and finish response."""
+    handler.write('data: [DONE]\n\n')
+    handler.finish()
+
+
+def _block_start(handler, content_type, **metadata):
+    event = {'type': 'content_block_start', 'content_type': content_type}
+    event.update(metadata)
+    _send_sse(handler, event)
+
+
+def _block_delta(handler, content_type, delta):
+    _send_sse(handler, {'type': 'content_block_delta', 'content_type': content_type, 'delta': delta})
+
+
+def _block_stop(handler, content_type, **metadata):
+    event = {'type': 'content_block_stop', 'content_type': content_type}
+    event.update(metadata)
+    _send_sse(handler, event)
+
+
+def sse_serializer(func):
+    """Decorator: wraps a serializer with init_sse / error handling / finish_sse.
+
+    The decorated function must be an async coroutine taking (handler, ...).
+    Any exception is caught and emitted as an SSE error event.
+    _finish_sse runs in finally.
+    """
+    @functools.wraps(func)
+    async def wrapper(handler, *args, **kwargs):
+        _init_sse(handler)
+        try:
+            await func(handler, *args, **kwargs)
+        except Exception as e:
+            _send_sse(handler, {'type': 'error', 'error': str(e)})
+        finally:
+            _finish_sse(handler)
+
+    return wrapper
+
+
+def _convert_messages_for_responses_api(messages):
+    """Convert Chat Completions messages to Responses API input format.
+
+    The Responses API uses 'developer' role instead of 'system'.
+    """
+    result = []
+    for m in messages:
+        role = m.get('role', 'user')
+        if role == 'system':
+            role = 'developer'
+        result.append({'role': role, 'content': m.get('content', '')})
+    return result
+
+
+def _extract_json_content(raw):
+    """Extract the 'content' field value from a partial JSON string.
+
+    The LLM responds with JSON like {"messages":[{"role":"assistant","content":"TEXT"}],...}.
+    This extracts TEXT for display during streaming, handling escape sequences.
+    Returns empty string if content field is not yet found.
+    """
+    match = re.search(r'"content"\s*:\s*"', raw)
+    if not match:
+        return ''
+    start = match.end()
+    result = []
+    i = start
+    while i < len(raw):
+        c = raw[i]
+        if c == '\\' and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            result.append({'n': '\n', 't': '\t', '"': '"', '\\': '\\'}.get(nxt, nxt))
+            i += 2
+        elif c == '"':
+            break
+        else:
+            result.append(c)
+            i += 1
+    return ''.join(result)
+
+
+@sse_serializer
+async def chat_openai(handler, api_key, model, messages, base_url=None):
+    """Serializer for OpenAI Responses API (used also for Enki Gate)."""
     kwargs = {'api_key': api_key or ''}
     if base_url:
         kwargs['base_url'] = base_url
-    client = OpenAI(**kwargs)
-    response = client.chat.completions.create(model=model, messages=messages)
-    return {'provider': 'openai', 'response': response.model_dump()}
+    client = AsyncOpenAI(**kwargs)
+
+    api_input = _convert_messages_for_responses_api(messages)
+    text_accumulated = ''
+
+    stream = await client.responses.create(
+        model=model, input=api_input, stream=True
+    )
+    async for event in stream:
+        if event.type == 'response.in_progress':
+            _block_start(handler, 'thinking')
+
+        elif event.type == 'response.content_part.added':
+            _block_stop(handler, 'thinking')
+            _block_start(handler, 'text')
+
+        elif event.type == 'response.reasoning_summary_text.delta':
+            _block_delta(handler, 'thinking', event.delta)
+
+        elif event.type == 'response.reasoning_summary_text.done':
+            _block_stop(handler, 'thinking', text=event.text)
+
+        elif event.type == 'response.output_text.delta':
+            text_accumulated += event.delta
+            display = _extract_json_content(text_accumulated)
+            if display:
+                _block_delta(handler, 'text', display)
+
+        elif event.type == 'response.output_text.done':
+            _block_stop(handler, 'text')
+
+        elif event.type == 'response.completed':
+            resp = event.response
+            stop_reason = getattr(resp, 'status', 'completed')
+            incomplete = getattr(resp, 'incomplete_details', None)
+            if incomplete:
+                stop_reason = str(getattr(incomplete, 'reason', stop_reason))
+            _send_sse(handler, {'type': 'message_done',
+                                'text': text_accumulated,
+                                'stop_reason': stop_reason})
+
+        elif event.type == 'response.failed':
+            error_msg = str(getattr(event, 'error', 'Unknown error'))
+            _send_sse(handler, {'type': 'error', 'error': error_msg})
 
 
-def chat_anthropic(api_key, model, messages):
-    client = Anthropic(api_key=api_key)
+def _build_anthropic_params(messages):
+    """Build Anthropic API parameters from message list.
 
+    Extracts system messages into a separate system param and appends
+    action data to message content.
+    """
     api_messages = []
     system_text = None
     for m in messages:
@@ -392,20 +558,59 @@ def chat_anthropic(api_key, model, messages):
             api_messages.append({'role': role, 'content': content})
 
     kwargs = {
-        'model': model,
-        'max_tokens': 4096,
-        'messages': api_messages
+        'max_tokens': 32000,
+        'messages': api_messages,
+        'thinking': {'type': 'enabled', 'budget_tokens': 2000}
     }
     if system_text:
         kwargs['system'] = system_text
+    return kwargs
 
-    response = client.messages.create(**kwargs)
-    return {'provider': 'anthropic', 'response': response.model_dump()}
+
+@sse_serializer
+async def chat_anthropic(handler, api_key, model, messages):
+    """Serializer for Anthropic messages.stream API."""
+    client = AsyncAnthropic(api_key=api_key)
+    kwargs = _build_anthropic_params(messages)
+
+    text_accumulated = ''
+    async with client.messages.stream(model=model, **kwargs) as stream:
+        # Anthropic の content_block.type は Mynerva の content_type と一致する
+        # サポート対象: 'thinking', 'text'
+        current_block_type = ''
+        async for event in stream:
+            if event.type == 'content_block_start':
+                block_type = event.content_block.type
+                if block_type in ('thinking', 'text'):
+                    current_block_type = block_type
+                    _block_start(handler, block_type)
+
+            elif event.type == 'content_block_delta':
+                delta = event.delta
+                if delta.type == 'thinking_delta':
+                    _block_delta(handler, 'thinking', delta.thinking)
+                elif delta.type == 'text_delta':
+                    text_accumulated += delta.text
+                    display = _extract_json_content(text_accumulated)
+                    if display:
+                        _block_delta(handler, 'text', display)
+
+            elif event.type == 'content_block_stop':
+                if current_block_type:
+                    _block_stop(handler, current_block_type)
+                    current_block_type = ''
+
+        final_msg = await stream.get_final_message()
+        final_text = await stream.get_final_text()
+        stop_reason = getattr(final_msg, 'stop_reason', 'end_turn')
+        _send_sse(handler, {'type': 'message_done',
+                            'text': final_text,
+                            'stop_reason': stop_reason or 'end_turn'})
 
 
 class ChatHandler(APIHandler):
     @tornado.web.authenticated
-    def post(self):
+    async def post(self):
         data = self.get_json_body()
         messages = data.get('messages', [])
 
@@ -415,8 +620,7 @@ class ChatHandler(APIHandler):
                       provider, model, base_url)
 
         if provider == 'echo':
-            result = chat_echo(messages)
-            self.finish(json.dumps(result))
+            await chat_echo(self, messages)
             return
 
         if provider == 'enki-gate':
@@ -427,9 +631,9 @@ class ChatHandler(APIHandler):
                 self.set_status(500)
                 self.finish(json.dumps({'error': 'Enki Gate not configured. Run device flow first.'}))
                 return
-            result = chat_openai(enki_token, enki_model, messages,
-                                 base_url=enki_url.rstrip('/') + '/v1')
-            self.finish(json.dumps(result))
+            enki_base = enki_url.rstrip('/') + '/v1'
+            await chat_openai(self, enki_token, enki_model, messages,
+                              base_url=enki_base)
             return
 
         if provider == 'openai':
@@ -437,19 +641,19 @@ class ChatHandler(APIHandler):
                 self.set_status(500)
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
-            result = chat_openai(api_key, model, messages, base_url=base_url)
-        elif provider == 'anthropic':
+            await chat_openai(self, api_key, model, messages, base_url=base_url)
+            return
+
+        if provider == 'anthropic':
             if not api_key:
                 self.set_status(500)
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
-            result = chat_anthropic(api_key, model, messages)
-        else:
-            self.set_status(400)
-            self.finish(json.dumps({'error': f'Unknown provider: {provider}'}))
+            await chat_anthropic(self, api_key, model, messages)
             return
 
-        self.finish(json.dumps(result))
+        self.set_status(400)
+        self.finish(json.dumps({'error': f'Unknown provider: {provider}'}))
 
 
 # Session management
