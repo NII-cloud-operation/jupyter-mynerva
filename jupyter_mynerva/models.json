@@ -1,0 +1,33 @@
+{
+  "openai": {
+    "allow": [
+      "gpt-5*",
+      "gpt-4.1*",
+      "gpt-4o*",
+      "o3*",
+      "o4-*"
+    ],
+    "deny": [
+      "*-codex*",
+      "*-search*",
+      "*-audio*",
+      "*-realtime*",
+      "*-tts*",
+      "*-transcribe*",
+      "*-image*",
+      "*-deep-research*",
+      "*-chat-latest",
+      "*-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
+    ]
+  },
+  "anthropic": {
+    "allow": [
+      "claude-sonnet-4-*",
+      "claude-haiku-4-*",
+      "claude-opus-4-*"
+    ],
+    "deny": [
+      "*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
+    ]
+  }
+}

@@ -14,6 +14,13 @@ from jupyter_mynerva.routes import (
     resolve_chat_config,
     _fetch_openai_models,
     _openai_models_cache,
+    _fetch_chat_models,
+    _chat_models_cache,
+    _filter_models,
+    _load_model_spec,
+    _get_provider_models,
+    _build_providers_with_models,
+    OpenAIModelsHandler,
     _NotebookStore,
     _convert_messages_for_responses_api,
     _build_anthropic_params,
@@ -181,10 +188,30 @@ def test_fetch_openai_models(monkeypatch):
 
 def test_fetch_openai_models_cache():
     _openai_models_cache.clear()
-    _openai_models_cache['http://cached/v1'] = ['cached-model']
+    _openai_models_cache[('http://cached/v1', 'key')] = ['cached-model']
 
     result = _fetch_openai_models('key', 'http://cached/v1')
     assert result == ['cached-model']
+
+
+def test_fetch_openai_models_cache_keyed_by_api_key(monkeypatch):
+    """Cache must not return one key's models when a different key is supplied.
+
+    Regression: cache_key was previously base_url only, so swapping the key
+    against the same endpoint silently returned the prior result (broken UX
+    when user wipes the key field expecting a re-auth).
+    """
+    _openai_models_cache.clear()
+    _openai_models_cache[('http://x/v1', 'key-A')] = ['model-from-A']
+
+    mock_response = MagicMock()
+    mock_response.data = [MagicMock(id='model-from-B')]
+    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
+        MockOpenAI.return_value.models.list.return_value = mock_response
+        result = _fetch_openai_models('key-B', 'http://x/v1')
+
+    assert result == ['model-from-B']
+    MockOpenAI.assert_called_once_with(api_key='key-B', base_url='http://x/v1')
 
 
 def test_fetch_openai_models_empty_raises():
@@ -197,6 +224,303 @@ def test_fetch_openai_models_empty_raises():
         MockOpenAI.return_value.models.list.return_value = mock_response
         with pytest.raises(ValueError, match='No models available'):
             _fetch_openai_models('key', 'http://localhost:8000/v1')
+
+
+# --- OpenAIModelsHandler ---
+
+def _make_models_handler(body):
+    """MagicMock handler instance pre-wired for OpenAIModelsHandler.post()."""
+    h = MagicMock()
+    h.current_user = 'user'  # bypass @tornado.web.authenticated
+    h.get_json_body.return_value = body
+    return h
+
+
+def test_openai_models_handler_success(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_openai_models',
+                        lambda key, url: ['model-x', 'model-y'])
+    handler = _make_models_handler({'baseUrl': 'http://x/v1', 'apiKey': 'k'})
+
+    OpenAIModelsHandler.post(handler)
+
+    written = handler.finish.call_args[0][0]
+    assert json.loads(written) == {'models': ['model-x', 'model-y']}
+    handler.set_status.assert_not_called()
+
+
+def test_openai_models_handler_passes_baseurl_and_apikey(monkeypatch):
+    """Frontend body keys 'baseUrl' / 'apiKey' must be honored (camelCase contract)."""
+    captured = {}
+
+    def fake_fetch(key, url):
+        captured['args'] = (key, url)
+        return ['m']
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_openai_models', fake_fetch)
+    handler = _make_models_handler({'baseUrl': 'http://endpoint/v1', 'apiKey': 'sk-x'})
+
+    OpenAIModelsHandler.post(handler)
+
+    assert captured['args'] == ('sk-x', 'http://endpoint/v1')
+
+
+def test_openai_models_handler_returns_500_with_error_body(monkeypatch):
+    """Auth / network errors must surface as JSON {error: ...} not bare 500."""
+    def fake_fetch(key, url):
+        raise RuntimeError('401: Missing bearer authentication in header')
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_openai_models', fake_fetch)
+    handler = _make_models_handler({'baseUrl': 'http://x/v1', 'apiKey': ''})
+
+    OpenAIModelsHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(500)
+    written = handler.finish.call_args[0][0]
+    body = json.loads(written)
+    assert 'Missing bearer authentication' in body['error']
+
+
+# --- _load_model_spec / _filter_models ---
+
+def test_load_model_spec_has_required_keys():
+    spec = _load_model_spec()
+    assert 'openai' in spec
+    assert 'anthropic' in spec
+    assert 'allow' in spec['openai']
+    assert 'allow' in spec['anthropic']
+
+
+def test_filter_models_allow_glob():
+    ids = ['gpt-5.2', 'gpt-5-mini', 'gpt-4', 'text-embedding-3', 'whisper-1']
+    result = _filter_models(ids, ['gpt-5*', 'gpt-4'], [])
+    assert result == ['gpt-4', 'gpt-5-mini', 'gpt-5.2']
+
+
+def test_filter_models_deny_takes_precedence():
+    ids = ['gpt-4o', 'gpt-4o-2024-08-06', 'gpt-4o-mini-2024-07-18']
+    result = _filter_models(ids, ['gpt-4o*'], ['*-????-??-??'])
+    assert result == ['gpt-4o']
+
+
+def test_filter_models_no_match_returns_empty():
+    ids = ['text-embedding-3', 'whisper-1']
+    result = _filter_models(ids, ['gpt-*'], [])
+    assert result == []
+
+
+def test_filter_models_returns_sorted():
+    ids = ['gpt-5-nano', 'gpt-5.2', 'gpt-5-mini']
+    result = _filter_models(ids, ['gpt-5*'], [])
+    assert result == sorted(['gpt-5-nano', 'gpt-5.2', 'gpt-5-mini'])
+
+
+def test_filter_models_anthropic_alias_only_strategy():
+    """Real-world spec: keep only alias-form Anthropic models, drop dated snapshots.
+
+    Regression: a naive deny pattern of '*-????????' would also match alias IDs
+    like 'claude-opus-4-6' (because '?' matches any char, not digits only).
+    Use [0-9] character class to constrain to digits.
+    """
+    ids = [
+        'claude-haiku-4-5-20251001',
+        'claude-opus-4-1-20250805',
+        'claude-opus-4-20250514',
+        'claude-opus-4-5-20251101',
+        'claude-opus-4-6',
+        'claude-opus-4-7',
+        'claude-sonnet-4-20250514',
+        'claude-sonnet-4-5-20250929',
+        'claude-sonnet-4-6',
+    ]
+    result = _filter_models(
+        ids, ['claude-*-4-*'],
+        ['*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'])
+    assert result == ['claude-opus-4-6', 'claude-opus-4-7', 'claude-sonnet-4-6']
+
+
+# --- _fetch_chat_models ---
+
+def _mock_models_response(ids, *, anthropic=False):
+    """Build a mock `client.models.list()` response.
+
+    Assigns an incrementing `created` (OpenAI) or `created_at` (Anthropic) so
+    tests of the date-DESC sort can specify order by argument index without
+    extra setup. Pass `(id, ts)` tuples to override.
+    """
+    from datetime import datetime, timezone
+    mocks = []
+    for i, item in enumerate(ids):
+        if isinstance(item, tuple):
+            mid, ts = item
+        else:
+            mid, ts = item, 1700000000 + i
+        m = MagicMock()
+        m.id = mid
+        if anthropic:
+            m.created_at = datetime.fromtimestamp(ts, tz=timezone.utc)
+        else:
+            m.created = ts
+        mocks.append(m)
+    response = MagicMock()
+    response.data = mocks
+    return response
+
+
+def test_fetch_chat_models_openai_filters_and_caches(monkeypatch):
+    _chat_models_cache.clear()
+    monkeypatch.setattr('jupyter_mynerva.routes._load_model_spec',
+                        lambda: {'openai': {'allow': ['gpt-5*'], 'deny': []}})
+
+    response = _mock_models_response(['gpt-5.2', 'text-embedding-3', 'gpt-5-mini'])
+
+    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
+        MockOpenAI.return_value.models.list.return_value = response
+        result = _fetch_chat_models('openai', 'admin-key')
+
+    assert result == ['gpt-5-mini', 'gpt-5.2']
+    MockOpenAI.assert_called_once_with(api_key='admin-key')
+
+    # Cached: second call must not re-invoke the client
+    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI2:
+        cached = _fetch_chat_models('openai', 'admin-key')
+    assert cached == ['gpt-5-mini', 'gpt-5.2']
+    MockOpenAI2.assert_not_called()
+
+
+def test_fetch_chat_models_anthropic_filters_and_caches(monkeypatch):
+    _chat_models_cache.clear()
+    monkeypatch.setattr('jupyter_mynerva.routes._load_model_spec',
+                        lambda: {'anthropic': {'allow': ['claude-*-4-*'], 'deny': []}})
+
+    response = _mock_models_response([
+        'claude-sonnet-4-5-20250929',
+        'claude-3-opus-20240229',
+        'claude-haiku-4-5-20251001',
+    ], anthropic=True)
+
+    with patch('jupyter_mynerva.routes.Anthropic') as MockAnthropic:
+        MockAnthropic.return_value.models.list.return_value = response
+        result = _fetch_chat_models('anthropic', 'admin-key')
+
+    assert result == ['claude-haiku-4-5-20251001', 'claude-sonnet-4-5-20250929']
+    MockAnthropic.assert_called_once_with(api_key='admin-key')
+
+
+def test_fetch_chat_models_sorted_by_created_desc(monkeypatch):
+    """Newer releases come first regardless of alphabetic ID order."""
+    _chat_models_cache.clear()
+    monkeypatch.setattr('jupyter_mynerva.routes._load_model_spec',
+                        lambda: {'openai': {'allow': ['gpt-*'], 'deny': []}})
+    # Alphabetic ASC would put gpt-4.1 first; created DESC puts gpt-5.5 first
+    response = _mock_models_response([
+        ('gpt-4.1', 1_700_000_000),
+        ('gpt-5', 1_750_000_000),
+        ('gpt-5.5', 1_800_000_000),
+    ])
+    with patch('jupyter_mynerva.routes.OpenAI') as MockOpenAI:
+        MockOpenAI.return_value.models.list.return_value = response
+        result = _fetch_chat_models('openai', 'admin-key')
+    assert result == ['gpt-5.5', 'gpt-5', 'gpt-4.1']
+
+
+# --- _get_provider_models ---
+
+def test_get_provider_models_openai_uses_admin_key(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG',
+                        {'openai_api_key': 'admin-key'})
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_chat_models',
+                        lambda pid, key: ['gpt-5.2']
+                        if (pid, key) == ('openai', 'admin-key') else [])
+
+    assert _get_provider_models('openai') == ['gpt-5.2']
+
+
+def test_get_provider_models_no_key_returns_empty(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {})
+    assert _get_provider_models('openai') == []
+    assert _get_provider_models('anthropic') == []
+
+
+def test_get_provider_models_unknown_provider_returns_empty(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG',
+                        {'openai_api_key': 'k', 'anthropic_api_key': 'k'})
+    assert _get_provider_models('enki-gate') == []
+    assert _get_provider_models('echo') == []
+
+
+def test_get_provider_models_openai_with_base_url(monkeypatch):
+    """When openai_base_url is set, route through _fetch_openai_models (raw, no filter)."""
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'openai_api_key': 'admin-key',
+        'openai_base_url': 'http://custom-endpoint/v1',
+    })
+    captured = {}
+
+    def fake_fetch_openai_models(api_key, base_url):
+        captured['args'] = (api_key, base_url)
+        return ['custom-model-a', 'custom-model-b']
+
+    def fake_fetch_chat_models(pid, key):
+        captured['chat_called'] = True
+        return []
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_openai_models',
+                        fake_fetch_openai_models)
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_chat_models',
+                        fake_fetch_chat_models)
+
+    result = _get_provider_models('openai')
+    assert result == ['custom-model-a', 'custom-model-b']
+    assert captured['args'] == ('admin-key', 'http://custom-endpoint/v1')
+    assert 'chat_called' not in captured  # filter path must not be invoked
+
+
+def test_get_provider_models_openai_with_base_url_no_api_key(monkeypatch):
+    """base_url without api_key still hits the custom endpoint (auth-less endpoints)."""
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'openai_base_url': 'http://no-auth-endpoint/v1',
+    })
+    captured = {}
+
+    def fake_fetch_openai_models(api_key, base_url):
+        captured['args'] = (api_key, base_url)
+        return ['m']
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_openai_models',
+                        fake_fetch_openai_models)
+
+    assert _get_provider_models('openai') == ['m']
+    assert captured['args'] == (None, 'http://no-auth-endpoint/v1')
+
+
+def test_get_provider_models_anthropic_ignores_openai_base_url(monkeypatch):
+    """openai_base_url must not affect anthropic provider."""
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'anthropic_api_key': 'a-key',
+        'openai_base_url': 'http://custom/v1',
+    })
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_chat_models',
+                        lambda pid, key: ['claude-x']
+                        if (pid, key) == ('anthropic', 'a-key') else [])
+
+    assert _get_provider_models('anthropic') == ['claude-x']
+
+
+# --- _build_providers_with_models ---
+
+def test_build_providers_with_models_attaches_model_lists(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.PROVIDERS', [
+        {'id': 'openai', 'displayName': 'OpenAI'},
+        {'id': 'anthropic', 'displayName': 'Anthropic'},
+    ])
+    monkeypatch.setattr('jupyter_mynerva.routes._get_provider_models',
+                        lambda pid: ['m1', 'm2'] if pid == 'openai' else ['c1'])
+
+    result = _build_providers_with_models()
+    assert result == [
+        {'id': 'openai', 'displayName': 'OpenAI', 'models': ['m1', 'm2']},
+        {'id': 'anthropic', 'displayName': 'Anthropic', 'models': ['c1']},
+    ]
 
 
 # --- resolve_chat_config ---
