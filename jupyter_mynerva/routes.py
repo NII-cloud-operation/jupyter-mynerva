@@ -1,3 +1,4 @@
+import fnmatch
 import functools
 import json
 import logging
@@ -10,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime
+from importlib.resources import files
 from pathlib import Path
 
 import cachetools
@@ -49,44 +51,24 @@ def AsyncAnthropic(*args, **kwargs):
     return _AsyncAnthropic(*args, **kwargs)
 
 
+def Anthropic(*args, **kwargs):
+    from anthropic import Anthropic as _Anthropic
+    return _Anthropic(*args, **kwargs)
+
+
 def Fernet(*args, **kwargs):
     from cryptography.fernet import Fernet as _Fernet
     return _Fernet(*args, **kwargs)
 
 
 PROVIDERS = [
-    {
-        'id': 'openai',
-        'displayName': 'OpenAI',
-        'models': [
-            'gpt-5.2',
-            'gpt-5-mini',
-            'gpt-5-nano',
-            'gpt-4.1',
-            'gpt-4.1-mini',
-            'gpt-4.1-nano'
-        ]
-    },
-    {
-        'id': 'anthropic',
-        'displayName': 'Anthropic',
-        'models': [
-            'claude-sonnet-4-5-20250929',
-            'claude-haiku-4-5-20251001',
-            'claude-opus-4-5-20251101',
-            'claude-sonnet-4-20250514',
-            'claude-opus-4-1-20250805'
-        ]
-    },
-    {
-        'id': 'enki-gate',
-        'displayName': 'Enki Gate',
-        'models': []
-    }
+    {'id': 'openai', 'displayName': 'OpenAI'},
+    {'id': 'anthropic', 'displayName': 'Anthropic'},
+    {'id': 'enki-gate', 'displayName': 'Enki Gate'}
 ]
 
 if os.environ.get('MYNERVA_ECHO_AGENT'):
-    PROVIDERS.append({'id': 'echo', 'displayName': 'Echo (Testing)', 'models': []})
+    PROVIDERS.append({'id': 'echo', 'displayName': 'Echo (Testing)'})
 
 DEFAULT_PROVIDER = 'openai'
 DEFAULT_MODEL = 'gpt-5.2'
@@ -164,20 +146,91 @@ if os.environ.get('MYNERVA_DEFAULTS_ONLY'):
     _DEFAULT_CONFIG['defaults_only'] = True
 
 
+def _load_model_spec():
+    """Load allow/deny glob patterns from models.json."""
+    spec_file = files('jupyter_mynerva').joinpath('models.json')
+    with spec_file.open() as f:
+        return json.load(f)
+
+
+def _filter_models(model_ids, allow, deny):
+    """Filter model IDs by glob allow/deny patterns. Returns sorted list."""
+    result = []
+    for model_id in model_ids:
+        if not any(fnmatch.fnmatch(model_id, p) for p in allow):
+            continue
+        if any(fnmatch.fnmatch(model_id, p) for p in deny):
+            continue
+        result.append(model_id)
+    return sorted(result)
+
+
+_chat_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
+
+_PROVIDER_KEY_FIELD = {
+    'openai': 'openai_api_key',
+    'anthropic': 'anthropic_api_key',
+}
+
+
+def _fetch_chat_models(provider_id, api_key):
+    """Fetch chat models, filter via models.json spec, sort by release date DESC.
+
+    Uses the provider's own `created` / `created_at` timestamp so newest
+    releases bubble to the top of the UI dropdown automatically.
+    """
+    if provider_id in _chat_models_cache:
+        return _chat_models_cache[provider_id]
+    spec = _load_model_spec()[provider_id]
+    if provider_id == 'openai':
+        # m.created is a Unix int seconds since epoch
+        created = {m.id: m.created
+                   for m in OpenAI(api_key=api_key).models.list().data}
+    elif provider_id == 'anthropic':
+        # m.created_at is a datetime
+        created = {m.id: m.created_at.timestamp()
+                   for m in Anthropic(api_key=api_key).models.list().data}
+    else:
+        raise ValueError(f'Unknown chat provider: {provider_id}')
+    filtered = _filter_models(list(created), spec['allow'], spec.get('deny', []))
+    models = sorted(filtered, key=lambda m: created[m], reverse=True)
+    _chat_models_cache[provider_id] = models
+    return models
+
+
 def _get_provider_models(provider_id):
-    """Returns model list for the given provider."""
-    for p in PROVIDERS:
-        if p['id'] == provider_id:
-            return p['models']
-    return []
+    """Returns dynamically fetched model list for the given provider.
+
+    For 'openai' with MYNERVA_OPENAI_BASE_URL set, hits the custom endpoint
+    via _fetch_openai_models (no allow/deny filter, since private catalogs).
+    Otherwise hits the official provider API and applies the models.json filter.
+    Returns empty list if no admin API key is configured.
+    """
+    if provider_id == 'openai' and (base_url := _DEFAULT_CONFIG.get('openai_base_url')):
+        return _fetch_openai_models(_DEFAULT_CONFIG.get('openai_api_key'), base_url)
+    key_field = _PROVIDER_KEY_FIELD.get(provider_id)
+    if not key_field:
+        return []
+    api_key = _DEFAULT_CONFIG.get(key_field)
+    if not api_key:
+        return []
+    return _fetch_chat_models(provider_id, api_key)
 
 
 _openai_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
 
 
 def _fetch_openai_models(api_key, base_url):
-    """Fetch model list from an OpenAI-compatible v1/models endpoint."""
-    cache_key = base_url
+    """Fetch model list from an OpenAI-compatible v1/models endpoint.
+
+    Used by the /openai-models endpoint and Enki Gate (custom base_url).
+    Returns the raw list without allow/deny filtering, since custom
+    endpoints may expose private model catalogs.
+
+    Cache key includes api_key so swapping keys against the same endpoint
+    re-fetches (different keys may have different model access).
+    """
+    cache_key = (base_url, api_key or '')
     if cache_key in _openai_models_cache:
         return _openai_models_cache[cache_key]
     client = OpenAI(api_key=api_key or '', base_url=base_url)
@@ -194,8 +247,7 @@ def get_default_config():
 
     - If only one API key (or base_url) is set, auto-select that provider
     - If both API keys are set, MYNERVA_DEFAULT_PROVIDER is required
-    - If model is not specified, use first model from provider's list
-      (fetched from v1/models when openai_base_url is set)
+    - If model is not specified, use first model from _get_provider_models()
     """
     has_openai = bool(_DEFAULT_CONFIG.get('openai_api_key') or
                       _DEFAULT_CONFIG.get('openai_base_url'))
@@ -219,16 +271,8 @@ def get_default_config():
     # Determine model
     model = _DEFAULT_CONFIG.get('model')
     if not model:
-        if provider == 'openai' and _DEFAULT_CONFIG.get('openai_base_url'):
-            base_url = _DEFAULT_CONFIG['openai_base_url']
-            models = _fetch_openai_models(
-                _DEFAULT_CONFIG.get('openai_api_key'), base_url)
-            model = models[0]
-            _log.info('Fetched %d models from %s, using %s',
-                      len(models), base_url, model)
-        else:
-            models = _get_provider_models(provider)
-            model = models[0] if models else ''
+        models = _get_provider_models(provider)
+        model = models[0] if models else ''
 
     result = {
         'provider': provider,
@@ -352,6 +396,14 @@ def is_encryption_configured():
     return bool(os.environ.get('MYNERVA_SECRET_KEY'))
 
 
+def _build_providers_with_models():
+    """Assemble PROVIDERS list with dynamically fetched model IDs."""
+    return [
+        {**p, 'models': _get_provider_models(p['id'])}
+        for p in PROVIDERS
+    ]
+
+
 class ProvidersHandler(APIHandler):
     @tornado.web.authenticated
     def get(self):
@@ -362,8 +414,16 @@ class ProvidersHandler(APIHandler):
             self.finish(json.dumps({'error': f'Filter config error: {e}'}))
             return
 
+        try:
+            providers = _build_providers_with_models()
+        except Exception as e:
+            _log.exception('Failed to fetch provider models')
+            self.set_status(500)
+            self.finish(json.dumps({'error': f'Failed to fetch models: {e}'}))
+            return
+
         result = {
-            'providers': PROVIDERS,
+            'providers': providers,
             'encryption': is_encryption_configured(),
             'defaults': get_default_config(),
             'filters': filters
@@ -955,7 +1015,13 @@ class OpenAIModelsHandler(APIHandler):
         data = self.get_json_body()
         base_url = data.get('baseUrl')
         api_key = data.get('apiKey')
-        models = _fetch_openai_models(api_key, base_url)
+        try:
+            models = _fetch_openai_models(api_key, base_url)
+        except Exception as e:
+            _log.warning('Failed to fetch models from %s: %s', base_url, e)
+            self.set_status(500)
+            self.finish(json.dumps({'error': str(e)}))
+            return
         self.finish(json.dumps({'models': models}))
 
 
