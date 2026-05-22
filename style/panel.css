@@ -99,6 +99,30 @@
   border-color: var(--jp-brand-color1);
 }
 
+.jp-Mynerva-settings-model-refresh {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--jp-ui-font-color2);
+  cursor: pointer;
+}
+
+.jp-Mynerva-settings-model-refresh:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.jp-Mynerva-settings-model-refresh:hover:not(:disabled) {
+  background: var(--jp-layout-color2);
+  color: var(--jp-ui-font-color1);
+}
+
 .jp-Mynerva-settings-warning {
   margin-bottom: 16px;
   padding: 8px;

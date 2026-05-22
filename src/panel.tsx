@@ -68,6 +68,7 @@ interface IProvider {
   id: string;
   displayName: string;
   models: string[];
+  modelsError?: string;
 }
 
 interface IBedrockRegion {
@@ -134,17 +135,19 @@ async function saveConfig(config: IConfig): Promise<void> {
   }
 }
 
-async function fetchOpenAIModels(
+async function fetchProviderModels(
+  provider: string,
+  apiKey: string,
   baseUrl: string,
-  apiKey: string
+  region?: string
 ): Promise<string[]> {
   const settings = ServerConnection.makeSettings();
-  const url = `${settings.baseUrl}jupyter-mynerva/openai-models`;
+  const url = `${settings.baseUrl}jupyter-mynerva/provider-models`;
   const response = await ServerConnection.makeRequest(
     url,
     {
       method: 'POST',
-      body: JSON.stringify({ baseUrl, apiKey })
+      body: JSON.stringify({ provider, apiKey, baseUrl, region })
     },
     settings
   );
@@ -159,29 +162,8 @@ async function fetchOpenAIModels(
   return data.models;
 }
 
-async function fetchBedrockModels(
-  region: string,
-  apiKey: string
-): Promise<string[]> {
-  const settings = ServerConnection.makeSettings();
-  const url = `${settings.baseUrl}jupyter-mynerva/bedrock-models`;
-  const response = await ServerConnection.makeRequest(
-    url,
-    {
-      method: 'POST',
-      body: JSON.stringify({ region, apiKey })
-    },
-    settings
-  );
-
-  if (!response.ok) {
-    const data = await response.json();
-    throw new Error(
-      data.error || `Failed to fetch models (${response.status})`
-    );
-  }
-  const data = await response.json();
-  return data.models;
+function isOpenAIDefaultBaseUrl(baseUrl: string): boolean {
+  return baseUrl.trim().replace(/\/+$/, '') === 'https://api.openai.com/v1';
 }
 
 interface IStreamCallbacks {
@@ -609,48 +591,58 @@ function SettingsView({
   const [customModels, setCustomModels] = React.useState<string[] | null>(null);
   const [fetchingModels, setFetchingModels] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [error, setError] = React.useState('');
+  const initialModelsError =
+    providers.find(p => p.id === initialProvider)?.modelsError || '';
+  const [error, setError] = React.useState(initialModelsError);
+  const hasOpenAICustomBaseUrl =
+    !!openaiBaseUrl && !isOpenAIDefaultBaseUrl(openaiBaseUrl);
+  const canFetchModels =
+    provider === 'openai'
+      ? !!(apiKey || hasOpenAICustomBaseUrl)
+      : provider === 'anthropic'
+        ? !!apiKey
+        : provider === 'bedrock'
+          ? !!apiKey
+          : false;
+
+  const loadModels = async () => {
+    if (!canFetchModels) {
+      return;
+    }
+    setFetchingModels(true);
+    setError('');
+    try {
+      const fetched = await fetchProviderModels(
+        provider,
+        apiKey,
+        openaiBaseUrl,
+        provider === 'bedrock' ? bedrockRegion : undefined
+      );
+      setCustomModels(fetched);
+      setModel(current =>
+        fetched.includes(current) ? current : fetched[0] || ''
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to fetch models');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
 
   React.useEffect(() => {
-    if (provider === 'openai' && openaiBaseUrl) {
-      setFetchingModels(true);
-      fetchOpenAIModels(openaiBaseUrl, apiKey)
-        .then(fetched => {
-          setCustomModels(fetched);
-          if (!fetched.includes(model)) {
-            setModel(fetched[0]);
-          }
-        })
-        .catch(e => {
-          setError(e instanceof Error ? e.message : 'Failed to fetch models');
-        })
-        .finally(() => setFetchingModels(false));
-    } else if (provider === 'bedrock' && apiKey) {
-      setFetchingModels(true);
-      fetchBedrockModels(bedrockRegion, apiKey)
-        .then(fetched => {
-          setCustomModels(fetched);
-          if (!fetched.includes(model)) {
-            setModel(fetched[0]);
-          }
-        })
-        .catch(e => {
-          setError(e instanceof Error ? e.message : 'Failed to fetch models');
-        })
-        .finally(() => setFetchingModels(false));
+    if (canFetchModels) {
+      void loadModels();
     }
   }, []);
 
   const currentProvider =
     providers.find(p => p.id === provider) || providers[0];
-  const models =
-    (provider === 'openai' || provider === 'bedrock') && customModels
-      ? customModels
-      : currentProvider?.models || [];
+  const models = customModels ? customModels : currentProvider?.models || [];
 
   const handleProviderChange = (newProvider: string) => {
     setProvider(newProvider);
     setCustomModels(null);
+    setError('');
     const newProviderData = providers.find(p => p.id === newProvider);
     if (newProviderData && !newProviderData.models.includes(model)) {
       setModel(newProviderData.models[0] || '');
@@ -658,41 +650,12 @@ function SettingsView({
   };
 
   const handleFetchModels = async () => {
-    if (provider === 'bedrock') {
-      if (!apiKey) {
-        setError('API key is required to fetch Bedrock models');
-        return;
-      }
-      setFetchingModels(true);
-      setError('');
-      try {
-        const fetched = await fetchBedrockModels(bedrockRegion, apiKey);
-        setCustomModels(fetched);
-        if (!fetched.includes(model)) {
-          setModel(fetched[0]);
-        }
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Failed to fetch models');
-      } finally {
-        setFetchingModels(false);
-      }
-      return;
-    }
-    if (!openaiBaseUrl) {
-      return;
-    }
-    setFetchingModels(true);
-    setError('');
-    try {
-      const fetched = await fetchOpenAIModels(openaiBaseUrl, apiKey);
-      setCustomModels(fetched);
-      if (!fetched.includes(model)) {
-        setModel(fetched[0]);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to fetch models');
-    } finally {
-      setFetchingModels(false);
+    await loadModels();
+  };
+
+  const handleModelSourceBlur = () => {
+    if (canFetchModels) {
+      void loadModels();
     }
   };
 
@@ -771,7 +734,11 @@ function SettingsView({
                   <input
                     type="text"
                     value={openaiBaseUrl}
-                    onChange={e => setOpenaiBaseUrl(e.target.value)}
+                    onChange={e => {
+                      setOpenaiBaseUrl(e.target.value);
+                      setCustomModels(null);
+                    }}
+                    onBlur={handleModelSourceBlur}
                     placeholder="https://api.openai.com/v1"
                   />
                 </div>
@@ -796,7 +763,11 @@ function SettingsView({
                 <input
                   type="password"
                   value={apiKey}
-                  onChange={e => setApiKey(e.target.value)}
+                  onChange={e => {
+                    setApiKey(e.target.value);
+                    setCustomModels(null);
+                  }}
+                  onBlur={handleModelSourceBlur}
                   placeholder="Enter API key"
                 />
               </div>
@@ -814,19 +785,12 @@ function SettingsView({
                       </option>
                     ))}
                   </select>
-                  {((provider === 'openai' && openaiBaseUrl) ||
-                    provider === 'bedrock') && (
+                  {provider !== 'enki-gate' && (
                     <button
+                      className="jp-Mynerva-settings-model-refresh"
                       onClick={handleFetchModels}
-                      disabled={fetchingModels}
-                      title="Fetch models from endpoint"
-                      style={{
-                        margin: 0,
-                        padding: '4px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        cursor: fetchingModels ? 'wait' : 'pointer'
-                      }}
+                      disabled={fetchingModels || !canFetchModels}
+                      title="Fetch models"
                     >
                       <refreshIcon.react
                         tag="span"

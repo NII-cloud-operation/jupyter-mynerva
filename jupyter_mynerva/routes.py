@@ -1,3 +1,4 @@
+import asyncio
 import fnmatch
 import functools
 import json
@@ -16,6 +17,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import cachetools
+from cryptography.fernet import InvalidToken
 import httpx
 
 _log = logging.getLogger(__name__)
@@ -184,55 +186,76 @@ _PROVIDER_KEY_FIELD = {
 }
 
 
-def _fetch_chat_models(provider_id, api_key):
+def _is_openai_default_base_url(base_url):
+    return base_url.strip().rstrip('/') == 'https://api.openai.com/v1'
+
+
+async def _fetch_chat_models(provider_id, api_key):
     """Fetch chat models, filter via models.json spec, sort by release date DESC.
 
     Uses the provider's own `created` / `created_at` timestamp so newest
     releases bubble to the top of the UI dropdown automatically.
     """
-    if provider_id in _chat_models_cache:
-        return _chat_models_cache[provider_id]
+    cache_key = (provider_id, api_key)
+    if cache_key in _chat_models_cache:
+        return _chat_models_cache[cache_key]
     spec = _load_model_spec()[provider_id]
     if provider_id == 'openai':
         # m.created is a Unix int seconds since epoch
-        created = {m.id: m.created
-                   for m in OpenAI(api_key=api_key).models.list().data}
+        response = await AsyncOpenAI(api_key=api_key).models.list()
+        created = {m.id: m.created for m in response.data}
     elif provider_id == 'anthropic':
         # m.created_at is a datetime
-        created = {m.id: m.created_at.timestamp()
-                   for m in Anthropic(api_key=api_key).models.list().data}
+        response = await AsyncAnthropic(api_key=api_key).models.list()
+        created = {m.id: m.created_at.timestamp() for m in response.data}
     else:
         raise ValueError(f'Unknown chat provider: {provider_id}')
     filtered = _filter_models(list(created), spec['allow'], spec.get('deny', []))
     models = sorted(filtered, key=lambda m: created[m], reverse=True)
-    _chat_models_cache[provider_id] = models
+    _chat_models_cache[cache_key] = models
     return models
 
 
-def _get_provider_models(provider_id):
-    """Returns dynamically fetched model list for the given provider.
+async def _get_provider_models(provider_id, api_key='', base_url='', region=''):
+    """Returns model list for the given provider credentials.
 
-    For 'openai' with MYNERVA_OPENAI_BASE_URL set, hits the custom endpoint
-    via _fetch_openai_models (no allow/deny filter, since private catalogs).
-    For 'bedrock', hits the Bedrock inference-profiles management API.
-    Otherwise hits the official provider API and applies the models.json filter.
-    Returns empty list if no admin API key is configured.
+    OpenAI-compatible custom endpoints return raw /v1/models results.
+    Official OpenAI and Anthropic providers apply the models.json filter.
+    Bedrock provider fetches from the inference-profiles management API.
     """
-    if provider_id == 'openai' and (base_url := _DEFAULT_CONFIG.get('openai_base_url')):
-        return _fetch_openai_models(_DEFAULT_CONFIG.get('openai_api_key'), base_url)
-    if provider_id == 'bedrock':
-        api_key = _DEFAULT_CONFIG.get('bedrock_api_key')
+    if provider_id == 'openai':
+        if base_url and not _is_openai_default_base_url(base_url):
+            return await _fetch_openai_models(api_key, base_url)
         if not api_key:
             return []
-        region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1')
-        return _fetch_bedrock_models(api_key, region)
+        return await _fetch_chat_models(provider_id, api_key)
+    if provider_id == 'anthropic':
+        if not api_key:
+            return []
+        return await _fetch_chat_models(provider_id, api_key)
+    if provider_id == 'bedrock':
+        if not api_key:
+            return []
+        return _fetch_bedrock_models(api_key, region or 'us-east-1')
+    return []
+
+
+async def _get_default_provider_models(provider_id):
     key_field = _PROVIDER_KEY_FIELD.get(provider_id)
-    if not key_field:
+    api_key = _DEFAULT_CONFIG.get(key_field, '') if key_field else ''
+    base_url = _DEFAULT_CONFIG.get('openai_base_url', '') if provider_id == 'openai' else ''
+    region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1') if provider_id == 'bedrock' else ''
+    return await _get_provider_models(provider_id, api_key, base_url, region)
+
+
+async def _get_config_provider_models(provider_id, config):
+    if _DEFAULT_CONFIG.get('defaults_only') or config.get('useDefault'):
+        return await _get_default_provider_models(provider_id)
+    if provider_id != config.get('provider'):
         return []
-    api_key = _DEFAULT_CONFIG.get(key_field)
-    if not api_key:
-        return []
-    return _fetch_chat_models(provider_id, api_key)
+    base_url = config.get('openaiBaseUrl', '') if provider_id == 'openai' else ''
+    region = config.get('bedrockRegion', '') if provider_id == 'bedrock' else ''
+    return await _get_provider_models(provider_id, config['apiKey'], base_url, region)
 
 
 _openai_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
@@ -295,7 +318,7 @@ def _fetch_bedrock_models(api_key, region):
     return models
 
 
-def _fetch_openai_models(api_key, base_url):
+async def _fetch_openai_models(api_key, base_url):
     """Fetch model list from an OpenAI-compatible v1/models endpoint.
 
     Used by the /openai-models endpoint and Enki Gate (custom base_url).
@@ -308,8 +331,8 @@ def _fetch_openai_models(api_key, base_url):
     cache_key = (base_url, api_key or '')
     if cache_key in _openai_models_cache:
         return _openai_models_cache[cache_key]
-    client = OpenAI(api_key=api_key or '', base_url=base_url)
-    response = client.models.list()
+    client = AsyncOpenAI(api_key=api_key or '', base_url=base_url)
+    response = await client.models.list()
     models = sorted([m.id for m in response.data])
     if not models:
         raise ValueError(f'No models available from {base_url}')
@@ -317,7 +340,7 @@ def _fetch_openai_models(api_key, base_url):
     return models
 
 
-def get_default_config():
+async def get_default_config():
     """Returns default config if available.
 
     - If only one API key (or base_url) is set, auto-select that provider
@@ -350,7 +373,7 @@ def get_default_config():
     # Determine model
     model = _DEFAULT_CONFIG.get('model')
     if not model:
-        models = _get_provider_models(provider)
+        models = await _get_default_provider_models(provider)
         model = models[0] if models else ''
 
     result = {
@@ -375,14 +398,14 @@ def get_default_api_key(provider):
     return None
 
 
-def resolve_chat_config(config):
+async def resolve_chat_config(config):
     """Resolve provider, model, api_key, base_url from config.
 
     All fields come from the same source (defaults or user config)
     to prevent credential leakage across trust boundaries.
     """
     if _DEFAULT_CONFIG.get('defaults_only') or config.get('useDefault'):
-        defaults = get_default_config()
+        defaults = await get_default_config()
         if not defaults:
             raise ValueError('Default configuration not available')
         provider = defaults['provider']
@@ -422,7 +445,12 @@ def decrypt_api_key(stored_value):
         if not fernet:
             raise ValueError('MYNERVA_SECRET_KEY is required to decrypt stored API key')
         encrypted = stored_value[len(ENCRYPTED_PREFIX):]
-        return fernet.decrypt(encrypted.encode()).decode()
+        try:
+            return fernet.decrypt(encrypted.encode()).decode()
+        except InvalidToken as e:
+            _log.warning('Failed to decrypt stored API key: %s', e)
+            raise ValueError(
+                'Failed to decrypt API key — MYNERVA_SECRET_KEY may have changed') from e
     return stored_value
 
 
@@ -430,7 +458,7 @@ def get_config_path():
     return Path.home() / '.mynerva' / 'config.json'
 
 
-def load_config():
+async def load_config():
     config_path = get_config_path()
     if config_path.exists():
         with open(config_path) as f:
@@ -445,13 +473,13 @@ def load_config():
                 config['configWarning'] = f'Config missing required fields: {", ".join(missing)}'
         try:
             config['apiKey'] = decrypt_api_key(config.get('apiKey', ''))
-        except ValueError:
+        except ValueError as e:
             config['apiKey'] = ''
-            config['decryptError'] = 'MYNERVA_SECRET_KEY is required to decrypt stored API key'
+            config['decryptError'] = str(e)
         return config
 
     # Config doesn't exist - check if defaults are available
-    defaults = get_default_config()
+    defaults = await get_default_config()
     if defaults:
         # Auto-generate config with useDefault=true
         config = {
@@ -479,17 +507,25 @@ def is_encryption_configured():
     return bool(os.environ.get('MYNERVA_SECRET_KEY'))
 
 
-def _build_providers_with_models():
+async def _build_providers_with_models(config=None):
     """Assemble PROVIDERS list with dynamically fetched model IDs."""
-    return [
-        {**p, 'models': _get_provider_models(p['id'])}
-        for p in PROVIDERS
-    ]
+    get_models = _get_config_provider_models if config else None
+
+    async def with_models(provider):
+        try:
+            models = await get_models(provider['id'], config) if get_models else \
+                await _get_default_provider_models(provider['id'])
+            return {**provider, 'models': models}
+        except Exception as e:
+            _log.warning('Failed to fetch models for %s: %s', provider['id'], e)
+            return {**provider, 'models': [], 'modelsError': str(e)}
+
+    return await asyncio.gather(*(with_models(p) for p in PROVIDERS))
 
 
 class ProvidersHandler(APIHandler):
     @tornado.web.authenticated
-    def get(self):
+    async def get(self):
         try:
             filters = load_filters()
         except (ValueError, tomllib.TOMLDecodeError) as e:
@@ -498,7 +534,8 @@ class ProvidersHandler(APIHandler):
             return
 
         try:
-            providers = _build_providers_with_models()
+            config = await load_config()
+            providers = await _build_providers_with_models(config)
         except Exception as e:
             _log.exception('Failed to fetch provider models')
             self.set_status(500)
@@ -508,7 +545,7 @@ class ProvidersHandler(APIHandler):
         result = {
             'providers': providers,
             'encryption': is_encryption_configured(),
-            'defaults': get_default_config(),
+            'defaults': await get_default_config(),
             'filters': filters,
             'bedrockRegions': _load_bedrock_regions(),
         }
@@ -519,8 +556,8 @@ class ProvidersHandler(APIHandler):
 
 class ConfigHandler(APIHandler):
     @tornado.web.authenticated
-    def get(self):
-        config = load_config()
+    async def get(self):
+        config = await load_config()
         self.finish(json.dumps(config))
 
     @tornado.web.authenticated
@@ -878,8 +915,8 @@ class ChatHandler(APIHandler):
         data = self.get_json_body()
         messages = data.get('messages', [])
 
-        config = load_config()
-        provider, model, api_key, base_url = resolve_chat_config(config)
+        config = await load_config()
+        provider, model, api_key, base_url = await resolve_chat_config(config)
         self.log.info('Chat request: provider=%s, model=%s, base_url=%s',
                       provider, model, base_url)
 
@@ -1227,12 +1264,12 @@ class EnkiGateDeviceFlowPollHandler(APIHandler):
 
 class OpenAIModelsHandler(APIHandler):
     @tornado.web.authenticated
-    def post(self):
+    async def post(self):
         data = self.get_json_body()
         base_url = data.get('baseUrl')
         api_key = data.get('apiKey')
         try:
-            models = _fetch_openai_models(api_key, base_url)
+            models = await _fetch_openai_models(api_key, base_url)
         except Exception as e:
             _log.warning('Failed to fetch models from %s: %s', base_url, e)
             self.set_status(500)
@@ -1261,6 +1298,38 @@ class BedrockModelsHandler(APIHandler):
         self.finish(json.dumps({'models': models}))
 
 
+class ProviderModelsHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self):
+        data = self.get_json_body()
+        provider = data['provider']
+        api_key = data.get('apiKey', '')
+        base_url = data.get('baseUrl', '') if provider == 'openai' else ''
+        region = data.get('region', '') if provider == 'bedrock' else ''
+
+        if provider not in ('openai', 'anthropic', 'bedrock'):
+            self.set_status(400)
+            self.finish(json.dumps({'error': f'Unsupported provider: {provider}'}))
+            return
+        openai_custom_base_url = (
+            provider == 'openai' and base_url and
+            not _is_openai_default_base_url(base_url)
+        )
+        if not api_key and not openai_custom_base_url:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'API key is required'}))
+            return
+
+        try:
+            models = await _get_provider_models(provider, api_key, base_url, region)
+        except Exception as e:
+            _log.warning('Failed to fetch %s models: %s', provider, e)
+            self.set_status(500)
+            self.finish(json.dumps({'error': str(e)}))
+            return
+        self.finish(json.dumps({'models': models}))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -1270,6 +1339,7 @@ def setup_route_handlers(web_app):
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
     openai_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'openai-models')
     bedrock_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'bedrock-models')
+    provider_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'provider-models')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -1281,6 +1351,7 @@ def setup_route_handlers(web_app):
         (chat_pattern, ChatHandler),
         (openai_models_pattern, OpenAIModelsHandler),
         (bedrock_models_pattern, BedrockModelsHandler),
+        (provider_models_pattern, ProviderModelsHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
