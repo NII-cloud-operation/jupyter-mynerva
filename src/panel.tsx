@@ -50,6 +50,7 @@ interface IConfig {
   apiKey: string;
   useDefault?: boolean;
   openaiBaseUrl?: string;
+  bedrockRegion?: string;
   enkiGateUrl?: string;
   enkiGateToken?: string;
   enkiGateModel?: string;
@@ -60,6 +61,7 @@ interface IDefaultConfig {
   provider: string;
   model: string;
   openaiBaseUrl?: string;
+  bedrockRegion?: string;
 }
 
 interface IProvider {
@@ -68,11 +70,17 @@ interface IProvider {
   models: string[];
 }
 
+interface IBedrockRegion {
+  id: string;
+  name: string;
+}
+
 interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
   defaultsOnly?: boolean;
+  bedrockRegions: IBedrockRegion[];
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -137,6 +145,31 @@ async function fetchOpenAIModels(
     {
       method: 'POST',
       body: JSON.stringify({ baseUrl, apiKey })
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(
+      data.error || `Failed to fetch models (${response.status})`
+    );
+  }
+  const data = await response.json();
+  return data.models;
+}
+
+async function fetchBedrockModels(
+  region: string,
+  apiKey: string
+): Promise<string[]> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/bedrock-models`;
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({ region, apiKey })
     },
     settings
   );
@@ -342,6 +375,7 @@ async function saveSession(
 interface ISettingsViewProps {
   config: IConfig;
   providers: IProvider[];
+  bedrockRegions: IBedrockRegion[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
   defaultsUnavailable: boolean;
@@ -544,6 +578,7 @@ function EnkiGateSettings({
 function SettingsView({
   config,
   providers,
+  bedrockRegions,
   encryption,
   defaults,
   defaultsUnavailable,
@@ -568,6 +603,9 @@ function SettingsView({
   const [openaiBaseUrl, setOpenaiBaseUrl] = React.useState(
     config.openaiBaseUrl || ''
   );
+  const [bedrockRegion, setBedrockRegion] = React.useState(
+    config.bedrockRegion || 'us-east-1'
+  );
   const [customModels, setCustomModels] = React.useState<string[] | null>(null);
   const [fetchingModels, setFetchingModels] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -587,13 +625,26 @@ function SettingsView({
           setError(e instanceof Error ? e.message : 'Failed to fetch models');
         })
         .finally(() => setFetchingModels(false));
+    } else if (provider === 'bedrock' && apiKey) {
+      setFetchingModels(true);
+      fetchBedrockModels(bedrockRegion, apiKey)
+        .then(fetched => {
+          setCustomModels(fetched);
+          if (!fetched.includes(model)) {
+            setModel(fetched[0]);
+          }
+        })
+        .catch(e => {
+          setError(e instanceof Error ? e.message : 'Failed to fetch models');
+        })
+        .finally(() => setFetchingModels(false));
     }
   }, []);
 
   const currentProvider =
     providers.find(p => p.id === provider) || providers[0];
   const models =
-    provider === 'openai' && customModels
+    (provider === 'openai' || provider === 'bedrock') && customModels
       ? customModels
       : currentProvider?.models || [];
 
@@ -607,6 +658,26 @@ function SettingsView({
   };
 
   const handleFetchModels = async () => {
+    if (provider === 'bedrock') {
+      if (!apiKey) {
+        setError('API key is required to fetch Bedrock models');
+        return;
+      }
+      setFetchingModels(true);
+      setError('');
+      try {
+        const fetched = await fetchBedrockModels(bedrockRegion, apiKey);
+        setCustomModels(fetched);
+        if (!fetched.includes(model)) {
+          setModel(fetched[0]);
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to fetch models');
+      } finally {
+        setFetchingModels(false);
+      }
+      return;
+    }
     if (!openaiBaseUrl) {
       return;
     }
@@ -635,7 +706,8 @@ function SettingsView({
         apiKey,
         useDefault,
         openaiBaseUrl:
-          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined
+          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined,
+        bedrockRegion: provider === 'bedrock' ? bedrockRegion : undefined
       };
       await saveConfig(newConfig);
       onSave(newConfig);
@@ -663,7 +735,8 @@ function SettingsView({
               onChange={e => setUseDefault(e.target.checked)}
             />
             Use default settings ({defaults.provider} / {defaults.model}
-            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`})
+            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`}
+            {defaults.bedrockRegion && ` @ ${defaults.bedrockRegion}`})
           </label>
         </div>
       )}
@@ -703,6 +776,21 @@ function SettingsView({
                   />
                 </div>
               )}
+              {provider === 'bedrock' && (
+                <div className="jp-Mynerva-settings-field">
+                  <label>AWS Region</label>
+                  <select
+                    value={bedrockRegion}
+                    onChange={e => setBedrockRegion(e.target.value)}
+                  >
+                    {bedrockRegions.map(r => (
+                      <option key={r.id} value={r.id}>
+                        {r.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div className="jp-Mynerva-settings-field">
                 <label>API Key</label>
                 <input
@@ -726,7 +814,8 @@ function SettingsView({
                       </option>
                     ))}
                   </select>
-                  {provider === 'openai' && openaiBaseUrl && (
+                  {((provider === 'openai' && openaiBaseUrl) ||
+                    provider === 'bedrock') && (
                     <button
                       onClick={handleFetchModels}
                       disabled={fetchingModels}
@@ -1129,6 +1218,9 @@ function MynervaComponent({
   liveQuery
 }: IMynervaComponentProps): React.ReactElement {
   const [providers, setProviders] = React.useState<IProvider[]>([]);
+  const [bedrockRegions, setBedrockRegions] = React.useState<IBedrockRegion[]>(
+    []
+  );
   const [encryption, setEncryption] = React.useState(false);
   const [defaults, setDefaults] = React.useState<IDefaultConfig | null>(null);
   const [defaultsOnly, setDefaultsOnly] = React.useState(false);
@@ -1168,6 +1260,7 @@ function MynervaComponent({
     Promise.all([getProviders(), getConfig(), getSessions()])
       .then(async ([providersRes, cfg, sessionsRes]) => {
         setProviders(providersRes.providers);
+        setBedrockRegions(providersRes.bedrockRegions || []);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
         if (providersRes.defaultsOnly) {
@@ -2062,6 +2155,7 @@ function MynervaComponent({
         <SettingsView
           config={config || defaultConfig}
           providers={providers}
+          bedrockRegions={bedrockRegions}
           encryption={encryption}
           defaults={defaults}
           defaultsUnavailable={!!(config?.useDefault && !defaults)}

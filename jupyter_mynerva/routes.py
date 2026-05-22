@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime
@@ -15,6 +16,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import cachetools
+import httpx
 
 _log = logging.getLogger(__name__)
 
@@ -28,6 +30,7 @@ from jupyter_server.utils import url_path_join
 import tornado
 
 from .echo_agent import chat_echo
+from .eventstream import EventStreamParser
 
 
 # Lazy import wrappers for heavy SDKs. The actual modules are loaded only on
@@ -64,6 +67,7 @@ def Fernet(*args, **kwargs):
 PROVIDERS = [
     {'id': 'openai', 'displayName': 'OpenAI'},
     {'id': 'anthropic', 'displayName': 'Anthropic'},
+    {'id': 'bedrock', 'displayName': 'Amazon Bedrock (Converse)'},
     {'id': 'enki-gate', 'displayName': 'Enki Gate'}
 ]
 
@@ -142,6 +146,13 @@ if 'MYNERVA_DEFAULT_MODEL' in os.environ:
 if 'MYNERVA_OPENAI_BASE_URL' in os.environ:
     _DEFAULT_CONFIG['openai_base_url'] = os.environ['MYNERVA_OPENAI_BASE_URL']
 
+if 'MYNERVA_BEDROCK_API_KEY' in os.environ:
+    _DEFAULT_CONFIG['bedrock_api_key'] = os.environ['MYNERVA_BEDROCK_API_KEY']
+    del os.environ['MYNERVA_BEDROCK_API_KEY']
+
+if 'MYNERVA_BEDROCK_REGION' in os.environ:
+    _DEFAULT_CONFIG['bedrock_region'] = os.environ['MYNERVA_BEDROCK_REGION']
+
 if os.environ.get('MYNERVA_DEFAULTS_ONLY'):
     _DEFAULT_CONFIG['defaults_only'] = True
 
@@ -203,11 +214,18 @@ def _get_provider_models(provider_id):
 
     For 'openai' with MYNERVA_OPENAI_BASE_URL set, hits the custom endpoint
     via _fetch_openai_models (no allow/deny filter, since private catalogs).
+    For 'bedrock', hits the Bedrock inference-profiles management API.
     Otherwise hits the official provider API and applies the models.json filter.
     Returns empty list if no admin API key is configured.
     """
     if provider_id == 'openai' and (base_url := _DEFAULT_CONFIG.get('openai_base_url')):
         return _fetch_openai_models(_DEFAULT_CONFIG.get('openai_api_key'), base_url)
+    if provider_id == 'bedrock':
+        api_key = _DEFAULT_CONFIG.get('bedrock_api_key')
+        if not api_key:
+            return []
+        region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1')
+        return _fetch_bedrock_models(api_key, region)
     key_field = _PROVIDER_KEY_FIELD.get(provider_id)
     if not key_field:
         return []
@@ -218,6 +236,63 @@ def _get_provider_models(provider_id):
 
 
 _openai_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
+_bedrock_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
+
+
+def _load_bedrock_regions():
+    """Load Bedrock region definitions from regions.json."""
+    spec_file = files('jupyter_mynerva').joinpath('regions.json')
+    with spec_file.open() as f:
+        return json.load(f)['bedrock']
+
+
+def _validate_bedrock_region(region):
+    valid_ids = {r['id'] for r in _load_bedrock_regions()}
+    if region not in valid_ids:
+        raise ValueError(f'Invalid AWS region: {region}')
+
+
+def _fetch_bedrock_models(api_key, region):
+    """Fetch active inference profile IDs from Bedrock management API.
+
+    Hits GET https://bedrock.{region}.amazonaws.com/inference-profiles with
+    bearer-token auth, keeps profiles with status=ACTIVE and
+    type=SYSTEM_DEFINED, then applies the models.json bedrock allow/deny
+    filter so the dropdown stays focused on chat-capable models.
+
+    Sync because model listing is a fast one-shot — unlike chat which is
+    long-lived and must not block the Tornado event loop.
+
+    Bedrock does not expose per-account grant info on this endpoint, so all
+    matching profiles in the region are returned; access failures surface
+    later at Converse invocation time.
+    """
+    _validate_bedrock_region(region)
+    cache_key = (region, api_key or '')
+    if cache_key in _bedrock_models_cache:
+        return _bedrock_models_cache[cache_key]
+    url = f'https://bedrock.{region}.amazonaws.com/inference-profiles'
+    headers = {'Authorization': f'Bearer {api_key}'}
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(url, headers=headers)
+    if resp.status_code != 200:
+        raise ValueError(
+            f'Bedrock list-profiles error ({resp.status_code}): {resp.text}')
+    data = resp.json()
+    summaries = data.get('inferenceProfileSummaries', [])
+    candidate_ids = [
+        p['inferenceProfileId']
+        for p in summaries
+        if p.get('status') == 'ACTIVE'
+        and p.get('type') == 'SYSTEM_DEFINED'
+        and p.get('inferenceProfileId')
+    ]
+    spec = _load_model_spec().get('bedrock', {'allow': ['*'], 'deny': []})
+    models = _filter_models(candidate_ids, spec['allow'], spec.get('deny', []))
+    if not models:
+        raise ValueError(f'No matching inference profiles available in {region}')
+    _bedrock_models_cache[cache_key] = models
+    return models
 
 
 def _fetch_openai_models(api_key, base_url):
@@ -246,27 +321,31 @@ def get_default_config():
     """Returns default config if available.
 
     - If only one API key (or base_url) is set, auto-select that provider
-    - If both API keys are set, MYNERVA_DEFAULT_PROVIDER is required
+    - If multiple keys are set, MYNERVA_DEFAULT_PROVIDER is required and must
+      name one of the configured providers
     - If model is not specified, use first model from _get_provider_models()
     """
     has_openai = bool(_DEFAULT_CONFIG.get('openai_api_key') or
                       _DEFAULT_CONFIG.get('openai_base_url'))
     has_anthropic = bool(_DEFAULT_CONFIG.get('anthropic_api_key'))
+    has_bedrock = bool(_DEFAULT_CONFIG.get('bedrock_api_key'))
 
-    if not has_openai and not has_anthropic:
+    candidates = [name for name, present in (
+        ('openai', has_openai),
+        ('anthropic', has_anthropic),
+        ('bedrock', has_bedrock),
+    ) if present]
+    if not candidates:
         return None
 
     # Determine provider
     explicit_provider = _DEFAULT_CONFIG.get('provider')
-    if has_openai and has_anthropic:
-        # Both keys present - require explicit provider
-        if not explicit_provider:
+    if len(candidates) == 1:
+        provider = candidates[0]
+    else:
+        if not explicit_provider or explicit_provider not in candidates:
             return None
         provider = explicit_provider
-    elif has_openai:
-        provider = 'openai'
-    else:
-        provider = 'anthropic'
 
     # Determine model
     model = _DEFAULT_CONFIG.get('model')
@@ -280,6 +359,8 @@ def get_default_config():
     }
     if _DEFAULT_CONFIG.get('openai_base_url'):
         result['openaiBaseUrl'] = _DEFAULT_CONFIG['openai_base_url']
+    if _DEFAULT_CONFIG.get('bedrock_region'):
+        result['bedrockRegion'] = _DEFAULT_CONFIG['bedrock_region']
     return result
 
 
@@ -289,6 +370,8 @@ def get_default_api_key(provider):
         return _DEFAULT_CONFIG.get('openai_api_key')
     elif provider == 'anthropic':
         return _DEFAULT_CONFIG.get('anthropic_api_key')
+    elif provider == 'bedrock':
+        return _DEFAULT_CONFIG.get('bedrock_api_key')
     return None
 
 
@@ -426,7 +509,8 @@ class ProvidersHandler(APIHandler):
             'providers': providers,
             'encryption': is_encryption_configured(),
             'defaults': get_default_config(),
-            'filters': filters
+            'filters': filters,
+            'bedrockRegions': _load_bedrock_regions(),
         }
         if _DEFAULT_CONFIG.get('defaults_only'):
             result['defaultsOnly'] = True
@@ -668,6 +752,126 @@ async def chat_anthropic(handler, api_key, model, messages):
                             'stop_reason': stop_reason or 'end_turn'})
 
 
+def _build_bedrock_converse_body(messages, model):
+    """Build the JSON body for a Bedrock Converse request.
+
+    Folds system messages into the top-level `system` field, wraps each
+    message's content as a [{text}] block, and appends action protocol
+    JSON inline (matching the chat_anthropic convention).
+
+    Extended thinking is enabled only for Claude/Anthropic models, since
+    non-Anthropic Bedrock models reject `additionalModelRequestFields.thinking`.
+    """
+    api_messages = []
+    system_blocks = []
+    for m in messages:
+        role = m.get('role')
+        content = m.get('content', '')
+        actions = m.get('actions')
+        if actions:
+            content += '\n\n[Actions proposed]\n' + json.dumps(actions)
+
+        if role == 'system':
+            system_blocks.append({'text': content})
+        else:
+            api_messages.append({'role': role, 'content': [{'text': content}]})
+
+    body = {
+        'messages': api_messages,
+        'inferenceConfig': {'maxTokens': 32000}
+    }
+    if system_blocks:
+        body['system'] = system_blocks
+
+    model_lower = model.lower()
+    if 'claude' in model_lower or 'anthropic' in model_lower:
+        body['additionalModelRequestFields'] = {
+            'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+        }
+    return body
+
+
+@sse_serializer
+async def chat_bedrock_converse(handler, api_key, region, model, messages):
+    """Serializer for Bedrock Converse Stream API.
+
+    Uses bearer-token auth against bedrock-runtime.{region}.amazonaws.com.
+    Short-term and long-term Bedrock API keys work directly as Bearer
+    tokens, so no AWS SigV4 or boto3 is needed.
+    """
+    _validate_bedrock_region(region)
+    body = _build_bedrock_converse_body(messages, model)
+    url = (f'https://bedrock-runtime.{region}.amazonaws.com'
+           f'/model/{urllib.parse.quote(model, safe="")}/converse-stream')
+    req_headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.amazon.eventstream',
+    }
+
+    parser = EventStreamParser()
+    text_accumulated = ''
+    current_block = None
+    stop_reason = 'end_turn'
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        async with client.stream('POST', url, headers=req_headers,
+                                 content=json.dumps(body)) as resp:
+            if resp.status_code != 200:
+                error_body = (await resp.aread()).decode('utf-8', errors='replace')
+                raise ValueError(
+                    f'Bedrock Converse error ({resp.status_code}): {error_body}')
+
+            async for chunk in resp.aiter_bytes():
+                for hdrs, payload in parser.feed(chunk):
+                    if hdrs.get(':message-type') == 'exception':
+                        try:
+                            err = json.loads(payload)
+                            msg = err.get('message', payload.decode('utf-8', errors='replace'))
+                        except json.JSONDecodeError:
+                            msg = payload.decode('utf-8', errors='replace')
+                        exc_type = hdrs.get(':exception-type', 'Exception')
+                        raise ValueError(f'Bedrock Converse {exc_type}: {msg}')
+
+                    event_type = hdrs.get(':event-type')
+                    if event_type == 'contentBlockDelta':
+                        data_obj = json.loads(payload)
+                        delta = data_obj.get('delta', {})
+                        if 'text' in delta:
+                            if current_block != 'text':
+                                if current_block:
+                                    _block_stop(handler, current_block)
+                                _block_start(handler, 'text')
+                                current_block = 'text'
+                            text_accumulated += delta['text']
+                            display = _extract_json_content(text_accumulated)
+                            if display:
+                                _block_delta(handler, 'text', display)
+                        elif 'reasoningContent' in delta:
+                            rc = delta['reasoningContent']
+                            if 'text' in rc:
+                                if current_block != 'thinking':
+                                    if current_block:
+                                        _block_stop(handler, current_block)
+                                    _block_start(handler, 'thinking')
+                                    current_block = 'thinking'
+                                _block_delta(handler, 'thinking', rc['text'])
+                    elif event_type == 'contentBlockStop':
+                        if current_block:
+                            _block_stop(handler, current_block)
+                            current_block = None
+                    elif event_type == 'messageStop':
+                        data_obj = json.loads(payload)
+                        stop_reason = data_obj.get('stopReason', stop_reason)
+
+    if current_block:
+        _block_stop(handler, current_block)
+
+    _send_sse(handler, {'type': 'message_done',
+                        'text': text_accumulated,
+                        'stop_reason': stop_reason})
+
+
 class ChatHandler(APIHandler):
     @tornado.web.authenticated
     async def post(self):
@@ -710,6 +914,18 @@ class ChatHandler(APIHandler):
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
             await chat_anthropic(self, api_key, model, messages)
+            return
+
+        if provider == 'bedrock':
+            if not api_key:
+                self.set_status(500)
+                self.finish(json.dumps({'error': 'API key not configured'}))
+                return
+            if config.get('useDefault') or _DEFAULT_CONFIG.get('defaults_only'):
+                region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1')
+            else:
+                region = config.get('bedrockRegion', 'us-east-1')
+            await chat_bedrock_converse(self, api_key, region, model, messages)
             return
 
         self.set_status(400)
@@ -1025,6 +1241,26 @@ class OpenAIModelsHandler(APIHandler):
         self.finish(json.dumps({'models': models}))
 
 
+class BedrockModelsHandler(APIHandler):
+    @tornado.web.authenticated
+    def post(self):
+        data = self.get_json_body()
+        api_key = data.get('apiKey')
+        region = data.get('region') or 'us-east-1'
+        if not api_key:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'apiKey is required'}))
+            return
+        try:
+            models = _fetch_bedrock_models(api_key, region)
+        except Exception as e:
+            _log.warning('Failed to fetch Bedrock models in %s: %s', region, e)
+            self.set_status(500)
+            self.finish(json.dumps({'error': str(e)}))
+            return
+        self.finish(json.dumps({'models': models}))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -1033,6 +1269,7 @@ def setup_route_handlers(web_app):
     config_pattern = url_path_join(base_url, 'jupyter-mynerva', 'config')
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
     openai_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'openai-models')
+    bedrock_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'bedrock-models')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -1043,6 +1280,7 @@ def setup_route_handlers(web_app):
         (config_pattern, ConfigHandler),
         (chat_pattern, ChatHandler),
         (openai_models_pattern, OpenAIModelsHandler),
+        (bedrock_models_pattern, BedrockModelsHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
