@@ -156,8 +156,9 @@ export function getActionHelp(actionName: string): string {
 
 const NBSEARCH_ACTIONS = `
 Search (indexed notebooks):
-  - searchNotebooks: { "query": "...", "focus": "...", "owner": "...", "filename": "...", "dateFrom": "YYYY-MM-DD", "dateTo": "YYYY-MM-DD", "start": N, "limit": N } - Find notebooks and return summaries focused on the user's purpose. "focus" is required and must describe the user's purpose for judging relevance. Default limit is 10.
+  - searchNotebooks: { "query": "...", "focus": "...", "owner": "...", "filename": "...", "dateFrom": "YYYY-MM-DD", "dateTo": "YYYY-MM-DD", "start": N, "limit": N, "sort": "mtime desc" } - Find notebooks and return summaries focused on the user's purpose. "focus" is required and must describe the user's purpose for judging relevance. Default limit is 10.
   searchNotebooks downloads each matched notebook payload from nbsearch storage, reads cells through nblibram with the privacy filter enabled by default, and sends those filtered cells to the configured LLM provider to create the summary.
+  Supported sort values: "mtime desc", "mtime asc", "ctime desc", "ctime asc", "atime desc", "atime asc", "lc_cell_meme__execution_end_time desc", "lc_cell_meme__execution_end_time asc". Prefer "mtime desc" when the user asks for recent updates, and "lc_cell_meme__execution_end_time desc" when the user asks for recently executed notebooks.
   Treat dateFrom/dateTo as the user's local calendar dates. The client converts them to UTC datetime bounds before querying.
   - getCellsFromSearch: { "referenceId": "...", "start": N, "limit": N } - Read privacy-filtered raw cells from a search result reference. start/limit are optional offsets within that reference's filtered cells.
   Prefer searchNotebooks over listNotebookFiles when the user asks to search, find, discover, or look across indexed notebooks.

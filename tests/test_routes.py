@@ -407,6 +407,7 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
             'dateTimeFrom': '2026-04-30T15:00:00.000Z',
             'dateTimeTo': '2026-05-01T15:00:00.000Z',
             'limit': 5,
+            'sort': 'mtime desc',
         },
     )
 
@@ -424,6 +425,7 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
         'mtime:[2026-04-30T15:00:00.000Z TO 2026-05-01T15:00:00.000Z]',
         '-mtime:"2026-05-01T15:00:00.000Z"',
     ]
+    assert params['sort'] == ['mtime desc']
     assert result['focus'] == 'pandas usage'
     assert result['results'][0] == {
         'path': 'foo.ipynb',
@@ -484,6 +486,34 @@ async def test_search_nbsearch_notebooks_requires_normalized_date_range(monkeypa
 
     assert error.value.status_code == 400
     assert error.value.reason == 'dateFrom must be normalized to dateTimeFrom by the client'
+
+
+@pytest.mark.asyncio
+async def test_search_nbsearch_notebooks_rejects_unsupported_sort(monkeypatch):
+    class FakeDB:
+        def __init__(self, config):
+            self.solr_base_url = 'http://solr:8983'
+            self.solr_notebook = 'notebooks'
+            self.solr_basic_auth_username = None
+            self.solr_basic_auth_password = None
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+
+    with pytest.raises(tornado.web.HTTPError) as error:
+        handler = _make_nbsearch_handler(
+            {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+        )
+        await handler._search_notebooks(
+            'notebooks',
+            {
+                'query': 'pandas',
+                'focus': 'pandas usage',
+                'sort': 'score desc',
+            },
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.reason == 'unsupported sort: score desc'
 
 
 @pytest.mark.asyncio
