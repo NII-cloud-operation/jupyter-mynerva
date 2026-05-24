@@ -30,6 +30,10 @@ function getActionLabel(action: IQueryAction): string {
       return `Get Cells from ${action.path}: ${JSON.stringify(action.query)}${action.count ? ` (count: ${action.count})` : ''}`;
     case 'getOutputFromFile':
       return `Get Output from ${action.path}: ${JSON.stringify(action.query)}`;
+    case 'searchNotebooks':
+      return `Search Notebooks: ${action.query} (summarize filtered cells with LLM)`;
+    case 'getCellsFromSearch':
+      return `Get Cells from Search: ${action.referenceId}${action.start !== undefined ? ` (start: ${action.start})` : ''}${action.limit ? ` (limit: ${action.limit})` : ''}`;
     case 'listHelp':
       return 'Show available actions';
     case 'help':

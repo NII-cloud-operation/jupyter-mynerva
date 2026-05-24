@@ -3,6 +3,7 @@ const QUERY_SYNTAX = `Query syntax:
   { "contains": "text" } - substring match
   { "start": N } - cell index
   { "id": "cellId" } - cell ID
+  { "meme": "UUID" } - nblineage cell meme ID
   { "active": true } - currently focused cell (active notebook only)
   { "selected": true } - selected cells (active notebook only)`;
 
@@ -11,6 +12,10 @@ interface IActionDetail {
   required: string[];
   optional: string[];
   usesQuery: boolean;
+}
+
+interface ISystemPromptOptions {
+  nbsearchAvailable?: boolean;
 }
 
 const ACTION_DETAILS: Record<string, IActionDetail> = {
@@ -67,6 +72,28 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     required: ['path', 'query'],
     optional: [],
     usesQuery: true
+  },
+  searchNotebooks: {
+    description:
+      'Search indexed notebooks and return focus-oriented summaries with search references',
+    required: ['query', 'focus'],
+    optional: [
+      'exact',
+      'owner',
+      'filename',
+      'dateFrom',
+      'dateTo',
+      'start',
+      'limit',
+      'sort'
+    ],
+    usesQuery: false
+  },
+  getCellsFromSearch: {
+    description: 'Read privacy-filtered raw cells from a search reference',
+    required: ['referenceId'],
+    optional: ['start', 'limit'],
+    usesQuery: false
   },
   insertCell: {
     description: 'Insert new cell',
@@ -127,7 +154,20 @@ export function getActionHelp(actionName: string): string {
   return lines.join('\n');
 }
 
-export function buildSystemPrompt(): string {
+const NBSEARCH_ACTIONS = `
+Search (indexed notebooks):
+  - searchNotebooks: { "query": "...", "focus": "...", "owner": "...", "filename": "...", "dateFrom": "YYYY-MM-DD", "dateTo": "YYYY-MM-DD", "start": N, "limit": N } - Find notebooks and return summaries focused on the user's purpose. "focus" is required and must describe the user's purpose for judging relevance. Default limit is 10.
+  searchNotebooks downloads each matched notebook payload from nbsearch storage, reads cells through nblibram with the privacy filter enabled by default, and sends those filtered cells to the configured LLM provider to create the summary.
+  Treat dateFrom/dateTo as the user's local calendar dates. The client converts them to UTC datetime bounds before querying.
+  - getCellsFromSearch: { "referenceId": "...", "start": N, "limit": N } - Read privacy-filtered raw cells from a search result reference. start/limit are optional offsets within that reference's filtered cells.
+  Prefer searchNotebooks over listNotebookFiles when the user asks to search, find, discover, or look across indexed notebooks.
+  listNotebookFiles only lists paths in a directory; it does not search notebook content or the nbsearch index.
+  searchNotebooks returns summaries, not raw cells. Summaries include supporting cell numbers when available. If details are needed, use one of the getCellsFromSearch actions listed in the search result references, optionally with start from the summary cell number.
+  Never call getCellsFromSearch until a prior searchNotebooks result has returned a concrete referenceId. Do not invent placeholder reference IDs.
+  If searchNotebooks returns numFound greater than start + returned, tell the user that more results are available. Use start with the same query and focus when more results are needed.
+`;
+
+export function buildSystemPrompt(options: ISystemPromptOptions = {}): string {
   return `You are Mynerva, a Jupyter notebook assistant.
 - Always respond with JSON only. No text before or after.
 - JSON structure:
@@ -153,6 +193,7 @@ Query (other files) - results include "path":
   - getCellsFromFile: { "path": "file.ipynb", "query": {...}, "count": N } - Get cell range
   - getOutputFromFile: { "path": "file.ipynb", "query": {...} } - Get output of matched cell
 
+${options.nbsearchAvailable ? NBSEARCH_ACTIONS : ''}
 Mutate (active notebook):
   - insertCell: { "position": {...} or "end", "cellType": "code"|"markdown", "source": "..." } - Insert new cell
   - updateCell: { "query": {...}, "source": "...", "_hash": "..." } - Update cell content (requires _hash from prior read)
@@ -164,6 +205,7 @@ Query syntax:
   { "contains": "text" } - substring match
   { "start": N } - cell index
   { "id": "cellId" } - cell ID
+  { "meme": "UUID" } - nblineage cell meme ID
   { "active": true } - currently focused cell (active notebook only)
   { "selected": true } - selected cells (active notebook only)
 

@@ -43,6 +43,23 @@ const ACTION_SCHEMAS: Record<
     required: ['path', 'query'],
     optional: []
   },
+  searchNotebooks: {
+    required: ['query', 'focus'],
+    optional: [
+      'exact',
+      'owner',
+      'filename',
+      'dateFrom',
+      'dateTo',
+      'start',
+      'limit',
+      'sort'
+    ]
+  },
+  getCellsFromSearch: {
+    required: ['referenceId'],
+    optional: ['start', 'limit']
+  },
   // Mutate actions
   insertCell: {
     required: ['position', 'cellType', 'source'],

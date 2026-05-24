@@ -82,7 +82,32 @@ interface IProvidersResponse {
   defaults: IDefaultConfig | null;
   defaultsOnly?: boolean;
   defaultsError?: string;
+  nbsearchAvailable?: boolean;
   bedrockRegions: IBedrockRegion[];
+}
+
+function getSearchCellsContinuationHint(results: string[]): string | null {
+  for (const result of results) {
+    try {
+      const parsed = JSON.parse(result);
+      const actionResult = parsed?.result?.result;
+      if (
+        parsed?.type === 'getCellsFromSearch' &&
+        actionResult?.hasMore === true &&
+        typeof actionResult.nextStart === 'number'
+      ) {
+        return [
+          '[Instruction]',
+          'The getCellsFromSearch result has hasMore=true.',
+          'If the user asked to continue reading, respond with JSON containing the next getCellsFromSearch action using the same referenceId and start=nextStart.',
+          'Do not provide the final summary until hasMore is false or the requested reading is complete.'
+        ].join('\n');
+      }
+    } catch {
+      // Non-JSON action feedback is passed through without an additional hint.
+    }
+  }
+  return null;
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -353,6 +378,79 @@ async function saveSession(
   if (!response.ok) {
     throw new Error(`Failed to save session (${response.status})`);
   }
+}
+
+async function callNBSearch(
+  target: 'notebooks' | 'cells-from-search',
+  action: IAction,
+  filterEnabled: boolean
+): Promise<unknown> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/nbsearch/${target}`;
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        ...normalizeSearchNotebooksAction(action),
+        noFilter: !filterEnabled || undefined
+      })
+    },
+    settings
+  );
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(body.error || `nbsearch ${target} failed`);
+  }
+  return body;
+}
+
+function parseLocalDate(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(year, month - 1, day);
+
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return date;
+}
+
+function normalizeSearchNotebooksAction(action: IAction): IAction {
+  if (action.type !== 'searchNotebooks') {
+    return action;
+  }
+
+  const normalized = { ...action };
+  if (action.dateFrom) {
+    const dateFrom = parseLocalDate(action.dateFrom);
+    if (!dateFrom) {
+      throw new Error('searchNotebooks dateFrom must be YYYY-MM-DD');
+    }
+    normalized.dateTimeFrom = dateFrom.toISOString();
+  }
+
+  if (action.dateTo) {
+    const dateTo = parseLocalDate(action.dateTo);
+    if (!dateTo) {
+      throw new Error('searchNotebooks dateTo must be YYYY-MM-DD');
+    }
+    dateTo.setDate(dateTo.getDate() + 1);
+    normalized.dateTimeTo = dateTo.toISOString();
+  }
+
+  return normalized;
 }
 
 interface ISettingsViewProps {
@@ -828,6 +926,8 @@ const QUERY_ACTION_TYPES = [
   'getSectionFromFile',
   'getCellsFromFile',
   'getOutputFromFile',
+  'searchNotebooks',
+  'getCellsFromSearch',
   'listHelp',
   'help'
 ];
@@ -1185,6 +1285,7 @@ function MynervaComponent({
   const [defaults, setDefaults] = React.useState<IDefaultConfig | null>(null);
   const [defaultsError, setDefaultsError] = React.useState<string | null>(null);
   const [defaultsOnly, setDefaultsOnly] = React.useState(false);
+  const [nbsearchAvailable, setNbsearchAvailable] = React.useState(false);
   const [config, setConfig] = React.useState<IConfig | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
   const [messages, setMessages] = React.useState<IMessage[]>([]);
@@ -1227,6 +1328,7 @@ function MynervaComponent({
         if (providersRes.defaultsError) {
           setDefaultsError(providersRes.defaultsError);
         }
+        setNbsearchAvailable(!!providersRes.nbsearchAvailable);
         if (providersRes.defaultsOnly) {
           setDefaultsOnly(true);
         }
@@ -1364,7 +1466,10 @@ function MynervaComponent({
       }
       case 'listHelp': {
         result = JSON.stringify(
-          { type: 'listHelp', result: buildSystemPrompt() },
+          {
+            type: 'listHelp',
+            result: buildSystemPrompt({ nbsearchAvailable })
+          },
           null,
           2
         );
@@ -1430,6 +1535,32 @@ function MynervaComponent({
         );
         result = JSON.stringify(
           { type: 'getOutputFromFile', path: action.path, result: outputs },
+          null,
+          2
+        );
+        break;
+      }
+      case 'searchNotebooks': {
+        const searchResult = await callNBSearch(
+          'notebooks',
+          action,
+          filterEnabled
+        );
+        result = JSON.stringify(
+          { type: 'searchNotebooks', result: searchResult },
+          null,
+          2
+        );
+        break;
+      }
+      case 'getCellsFromSearch': {
+        const searchResult = await callNBSearch(
+          'cells-from-search',
+          action,
+          filterEnabled
+        );
+        result = JSON.stringify(
+          { type: 'getCellsFromSearch', result: searchResult },
           null,
           2
         );
@@ -1723,17 +1854,23 @@ function MynervaComponent({
       setLoading(true);
       const results = pendingResults;
       setPendingResults([]);
+      const continuationHint = getSearchCellsContinuationHint(results);
 
       const feedbackMessage: IMessage = {
         role: 'user',
-        content: `[Action Results]\n${results.join('\n\n')}`,
+        content: [`[Action Results]\n${results.join('\n\n')}`, continuationHint]
+          .filter(Boolean)
+          .join('\n\n'),
         generated: true
       };
       const newMessages = [...messages, feedbackMessage];
       setMessages(newMessages);
 
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        {
+          role: 'system' as const,
+          content: buildSystemPrompt({ nbsearchAvailable })
+        },
         ...newMessages
       ];
 
@@ -1873,7 +2010,10 @@ function MynervaComponent({
         setMessages(newMessages);
 
         const chatMessages = [
-          { role: 'system' as const, content: buildSystemPrompt() },
+          {
+            role: 'system' as const,
+            content: buildSystemPrompt({ nbsearchAvailable })
+          },
           ...newMessages
         ];
 
@@ -1916,7 +2056,10 @@ function MynervaComponent({
       setMessages(newMessages);
 
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        {
+          role: 'system' as const,
+          content: buildSystemPrompt({ nbsearchAvailable })
+        },
         ...newMessages
       ];
 
@@ -1974,7 +2117,10 @@ function MynervaComponent({
 
     try {
       const chatMessages = [
-        { role: 'system' as const, content: buildSystemPrompt() },
+        {
+          role: 'system' as const,
+          content: buildSystemPrompt({ nbsearchAvailable })
+        },
         ...newMessages
       ];
 
