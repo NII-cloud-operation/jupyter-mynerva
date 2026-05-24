@@ -77,16 +77,7 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     description:
       'Search indexed notebooks and return focus-oriented summaries with search references',
     required: ['query', 'focus'],
-    optional: [
-      'exact',
-      'owner',
-      'filename',
-      'dateFrom',
-      'dateTo',
-      'start',
-      'limit',
-      'sort'
-    ],
+    optional: ['dateFrom', 'dateTo', 'start', 'limit', 'sort'],
     usesQuery: false
   },
   getCellsFromSearch: {
@@ -156,14 +147,15 @@ export function getActionHelp(actionName: string): string {
 
 const NBSEARCH_ACTIONS = `
 Search (indexed notebooks):
-  - searchNotebooks: { "query": "...", "focus": "...", "owner": "...", "filename": "...", "dateFrom": "YYYY-MM-DD", "dateTo": "YYYY-MM-DD", "start": N, "limit": N, "sort": "mtime desc" } - Find notebooks and return summaries focused on the user's purpose. "focus" is required and must describe the user's purpose for judging relevance. Default limit is 10.
+  - searchNotebooks: { "query": "...", "focus": "...", "dateFrom": "YYYY-MM-DD", "dateTo": "YYYY-MM-DD", "start": N, "limit": N, "sort": "mtime desc" } - Find notebooks with a Solr/Lucene query string and return summaries focused on the user's purpose. "focus" is required and must describe the user's purpose for judging relevance. Default limit is 10.
+  The searchNotebooks query is sent to the jupyter-notebook Solr core as q. Use fielded Solr queries when the user specifies fields: filename:*BinderHub* for file name contains, owner:alice for owner, source__markdown__heading_1:検索 for top-level title/heading, and plain terms such as BinderHub for normal content/topic search.
   searchNotebooks downloads each matched notebook payload from nbsearch storage, reads cells through nblibram with the privacy filter enabled by default, and sends those filtered cells to the configured LLM provider to create the summary.
   Supported sort values: "mtime desc", "mtime asc", "ctime desc", "ctime asc", "atime desc", "atime asc", "lc_cell_meme__execution_end_time desc", "lc_cell_meme__execution_end_time asc". Prefer "mtime desc" when the user asks for recent updates, and "lc_cell_meme__execution_end_time desc" when the user asks for recently executed notebooks.
   Treat dateFrom/dateTo as the user's local calendar dates. The client converts them to UTC datetime bounds before querying.
   - getCellsFromSearch: { "referenceId": "...", "start": N, "limit": N } - Read privacy-filtered raw cells from a search result reference. start/limit are optional offsets within that reference's filtered cells.
   Prefer searchNotebooks over listNotebookFiles when the user asks to search, find, discover, or look across indexed notebooks.
   listNotebookFiles only lists paths in a directory; it does not search notebook content or the nbsearch index.
-  searchNotebooks returns summaries, not raw cells. Summaries include supporting cell numbers when available. If details are needed, use one of the getCellsFromSearch actions listed in the search result references, optionally with start from the summary cell number.
+  searchNotebooks returns filename, owner, server, mtime, ctime, atime, summaries, and references; it does not return raw cells. Summaries include supporting cell numbers when available. If details are needed, use one of the getCellsFromSearch actions listed in the search result references, optionally with start from the summary cell number.
   Never call getCellsFromSearch until a prior searchNotebooks result has returned a concrete referenceId. Do not invent placeholder reference IDs.
   If searchNotebooks returns numFound greater than start + returned, tell the user that more results are available. Use start with the same query and focus when more results are needed.
 `;

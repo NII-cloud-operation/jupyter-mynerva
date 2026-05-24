@@ -46,9 +46,6 @@ const ACTION_SCHEMAS: Record<
   searchNotebooks: {
     required: ['query', 'focus'],
     optional: [
-      'exact',
-      'owner',
-      'filename',
       'dateFrom',
       'dateTo',
       'start',

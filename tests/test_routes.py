@@ -225,22 +225,13 @@ def _make_nbsearch_handler(config):
     return NBSearchHandler(app, request)
 
 
-def test_build_nbsearch_query_structured_fields():
+def test_build_nbsearch_query_uses_raw_solr_query():
     query = _build_nbsearch_query(
         {
-            'query': 'pandas read_csv',
-            'owner': 'alice',
-            'filename': 'analysis.ipynb',
-        },
-        {
-            'owner': 'owner',
-            'filename': 'filename',
-            'mtime': 'mtime',
-        },
+            'query': 'filename:*BinderHub* AND source__markdown__heading_1:構築',
+        }
     )
-    assert 'pandas read_csv' in query
-    assert 'owner:"alice"' in query
-    assert 'filename:"analysis.ipynb"' in query
+    assert query == 'filename:*BinderHub* AND source__markdown__heading_1:構築'
 
 
 def test_build_nbsearch_filter_queries_uses_normalized_datetime_range():
@@ -371,7 +362,10 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
                 'id': 'notebook',
                 'filename': 'foo.ipynb',
                 'owner': 'alice',
+                'server': 'http://localhost:8000/',
                 'mtime': '2026-05-01T00:00:00Z',
+                'ctime': '2026-04-30T00:00:00Z',
+                'atime': '2026-05-02T00:00:00Z',
                 'source__markdown__heading': '## Data',
                 'source__markdown__heading_count': '1',
                 'score': 1.0,
@@ -400,7 +394,7 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
     result = await handler._search_notebooks(
         'notebooks',
         {
-            'query': 'pandas',
+            'query': 'filename:*foo* AND pandas',
             'focus': 'pandas usage',
             'dateFrom': '2026-05-01',
             'dateTo': '2026-05-01',
@@ -417,6 +411,7 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
     params = parse_qs(urlparse(requested_url).query)
     assert 'group' not in params
     assert 'group.field' not in params
+    assert params['q'] == ['filename:*foo* AND pandas']
     assert params['fl'][0] == (
         'id,filename,owner,server,mtime,ctime,atime,source__markdown__heading,'
         'source__markdown__heading_count,lc_cell_memes,lc_cell_meme__execution_end_time,score'
@@ -427,8 +422,14 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
     ]
     assert params['sort'] == ['mtime desc']
     assert result['focus'] == 'pandas usage'
+    assert result['query'] == 'filename:*foo* AND pandas'
     assert result['results'][0] == {
-        'path': 'foo.ipynb',
+        'filename': 'foo.ipynb',
+        'owner': 'alice',
+        'server': 'http://localhost:8000/',
+        'mtime': '2026-05-01T00:00:00Z',
+        'ctime': '2026-04-30T00:00:00Z',
+        'atime': '2026-05-02T00:00:00Z',
         'summary': 'focus に関連する notebook です。',
         'references': [
             {
@@ -531,7 +532,7 @@ async def test_get_search_reference_cells_returns_empty_for_invalid_payload(monk
             FakeDB(),
             {
                 'notebookId': 'broken-notebook',
-                'path': 'broken.ipynb',
+                'filename': 'broken.ipynb',
                 'query': {'start': 0},
                 'count': 3,
             },
@@ -543,7 +544,7 @@ async def test_get_search_reference_cells_returns_empty_for_invalid_payload(monk
         'error': 'notebook payload is not valid JSON',
     }
     assert any(
-        'Invalid nbsearch notebook payload: notebook_id=broken-notebook path=broken.ipynb' in record.message
+        'Invalid nbsearch notebook payload: notebook_id=broken-notebook filename=broken.ipynb' in record.message
         for record in caplog.records
     )
 

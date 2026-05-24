@@ -11,6 +11,20 @@ interface IQueryActionCardProps {
 }
 
 function getActionLabel(action: IQueryAction): string {
+  const searchParts = (searchAction: Extract<IQueryAction, { type: 'searchNotebooks' }>): string[] => {
+    const parts = [`query: ${searchAction.query}`];
+    if (searchAction.sort) {
+      parts.push(`sort: ${searchAction.sort}`);
+    }
+    if (searchAction.limit !== undefined) {
+      parts.push(`limit: ${searchAction.limit}`);
+    }
+    if (searchAction.start !== undefined) {
+      parts.push(`start: ${searchAction.start}`);
+    }
+    return parts;
+  };
+
   switch (action.type) {
     case 'getToc':
       return 'Get Table of Contents';
@@ -31,7 +45,7 @@ function getActionLabel(action: IQueryAction): string {
     case 'getOutputFromFile':
       return `Get Output from ${action.path}: ${JSON.stringify(action.query)}`;
     case 'searchNotebooks':
-      return `Search Notebooks: ${action.query}${action.sort ? ` (sort: ${action.sort})` : ''} (summarize filtered cells with LLM)`;
+      return `Search Notebooks: ${searchParts(action).join(', ')} (summarize filtered cells with LLM)`;
     case 'getCellsFromSearch':
       return `Get Cells from Search: ${action.referenceId}${action.start !== undefined ? ` (start: ${action.start})` : ''}${action.limit ? ` (limit: ${action.limit})` : ''}`;
     case 'listHelp':

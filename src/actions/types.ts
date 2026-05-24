@@ -93,9 +93,6 @@ export interface ISearchNotebooksAction {
   type: 'searchNotebooks';
   query: string;
   focus: string;
-  exact?: boolean;
-  owner?: string;
-  filename?: string;
   dateFrom?: string;
   dateTo?: string;
   dateTimeFrom?: string;

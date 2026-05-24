@@ -131,6 +131,17 @@ Query actions show a preview before sending to LLM. Users can choose to apply pr
 | `getCellsFromFile`   | `path`, `query`, `count?` | Cell range from matched position        |
 | `getOutputFromFile`  | `path`, `query`           | Output of matched cell                  |
 
+### Query: Indexed Notebooks
+
+When [nbsearch](https://github.com/NII-cloud-operation/nbsearch) is configured for the Jupyter server, Mynerva can search the nbsearch `jupyter-notebook` index and then read matched notebook payloads through nblibram with privacy filtering enabled.
+
+| Action               | Parameters                              | Description                                      |
+| -------------------- | --------------------------------------- | ------------------------------------------------ |
+| `searchNotebooks`    | `query`, `focus`, `sort?`, `limit?`     | Search indexed notebooks and return summaries    |
+| `getCellsFromSearch` | `referenceId`, `start?`, `limit?`       | Read filtered cells from a search result         |
+
+`searchNotebooks.query` is a Solr/Lucene query string sent to nbsearch. For example, use `filename:*Search*` to find notebooks whose filename contains `Search`, or `*:*` with `sort: "mtime desc"` to fetch recently modified notebooks. Search results return metadata such as `filename`, timestamps, summaries, and references; raw cells are fetched only through `getCellsFromSearch`.
+
 ### Query Syntax
 
 ```json
@@ -294,6 +305,10 @@ Users can configure their own settings via the panel settings UI:
 - Enki Gate connection (device flow)
 
 If default configuration is available, users can choose "Use default settings" instead of providing their own API key.
+
+### nbsearch
+
+If [nbsearch](https://github.com/NII-cloud-operation/nbsearch) is enabled in the same Jupyter server configuration, Mynerva exposes indexed notebook search actions. Mynerva reads the existing nbsearch traitlets configuration (`c.NBSearchDB.*`) to talk to Solr and object storage; it does not maintain a separate nbsearch connection setting.
 
 ## Requirements
 

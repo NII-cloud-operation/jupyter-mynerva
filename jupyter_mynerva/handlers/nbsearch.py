@@ -36,8 +36,6 @@ _NBSEARCH_NOTEBOOK_FL = [
 ]
 
 _NBSEARCH_NOTEBOOK_FIELDS = {
-    'owner': 'owner',
-    'filename': 'filename',
     'mtime': 'mtime',
 }
 
@@ -65,20 +63,8 @@ def _solr_phrase(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def _nbsearch_query_value(value, exact):
-    return _solr_phrase(value) if exact else value
-
-
-def _build_nbsearch_query(data, fields):
-    exact = bool(data.get('exact'))
-    parts = []
-    if data.get('query'):
-        parts.append(_nbsearch_query_value(data['query'], exact))
-    if data.get('owner'):
-        parts.append(f"{fields['owner']}:{_solr_phrase(data['owner'])}")
-    if data.get('filename'):
-        parts.append(f"{fields['filename']}:{_solr_phrase(data['filename'])}")
-    return ' AND '.join(parts) if parts else '*:*'
+def _build_nbsearch_query(data):
+    return data.get('query') or '*:*'
 
 
 def _build_nbsearch_filter_queries(data, fields):
@@ -120,7 +106,7 @@ def has_nbsearch_config(config):
 
 def _shape_nbsearch_notebook_reference(doc, query):
     return {
-        'path': doc['filename'],
+        'filename': doc['filename'],
         'notebookId': doc['id'],
         'query': {'start': 0},
         'start': None,
@@ -314,7 +300,7 @@ class NBSearchHandler(APIHandler):
             raise tornado.web.HTTPError(400, reason='focus is required')
         _validate_nbsearch_date_range(data)
 
-        query = _build_nbsearch_query(data, _NBSEARCH_NOTEBOOK_FIELDS)
+        query = _build_nbsearch_query(data)
         filters = _build_nbsearch_filter_queries(data, _NBSEARCH_NOTEBOOK_FIELDS)
         start = int(data.get('start', 0))
         limit = int(data.get('limit', 10))
@@ -417,7 +403,7 @@ class NBSearchHandler(APIHandler):
         return {
             'type': 'getCellsFromSearch',
             'referenceId': reference_id,
-            'path': reference['path'],
+            'filename': reference['filename'],
             'result': result,
         }
 
@@ -476,9 +462,9 @@ class NBSearchHandler(APIHandler):
         try:
             if not await asyncio.to_thread(self._is_valid_notebook_payload, notebook_path):
                 self.log.error(
-                    'Invalid nbsearch notebook payload: notebook_id=%s path=%s',
+                    'Invalid nbsearch notebook payload: notebook_id=%s filename=%s',
                     reference['notebookId'],
-                    reference['path'],
+                    reference['filename'],
                 )
                 return {
                     'cells': [],
@@ -494,7 +480,7 @@ class NBSearchHandler(APIHandler):
         finally:
             os.unlink(notebook_path)
 
-    async def _summarize_result(self, focus, path, cells):
+    async def _summarize_result(self, focus, filename, cells):
         from jupyter_mynerva import routes
 
         config = await routes.load_config()
@@ -515,7 +501,7 @@ class NBSearchHandler(APIHandler):
                 'role': 'user',
                 'content': json.dumps({
                     'focus': focus,
-                    'path': path,
+                    'filename': filename,
                     'cells': cells,
                 }, ensure_ascii=False),
             },
@@ -529,10 +515,10 @@ class NBSearchHandler(APIHandler):
                 response = await client.responses.create(model=model, input=messages)
             except Exception:
                 self.log.exception(
-                    'Failed to summarize nbsearch result: provider=%s model=%s path=%s',
+                    'Failed to summarize nbsearch result: provider=%s model=%s filename=%s',
                     provider,
                     model,
-                    path,
+                    filename,
                 )
                 raise
             return response.output_text.strip()
@@ -545,10 +531,10 @@ class NBSearchHandler(APIHandler):
                 response = await client.responses.create(model=enki_model, input=messages)
             except Exception:
                 self.log.exception(
-                    'Failed to summarize nbsearch result: provider=%s model=%s path=%s',
+                    'Failed to summarize nbsearch result: provider=%s model=%s filename=%s',
                     provider,
                     enki_model,
-                    path,
+                    filename,
                 )
                 raise
             return response.output_text.strip()
@@ -559,16 +545,23 @@ class NBSearchHandler(APIHandler):
                 response = await client.messages.create(model=model, **kwargs)
             except Exception:
                 self.log.exception(
-                    'Failed to summarize nbsearch result: provider=%s model=%s path=%s',
+                    'Failed to summarize nbsearch result: provider=%s model=%s filename=%s',
                     provider,
                     model,
-                    path,
+                    filename,
                 )
                 raise
             return ''.join(block.text for block in response.content if block.type == 'text').strip()
         if provider == 'echo':
-            return f'{path} は検索 focus に関連する notebook です。関連箇所は提示されたセル番号を確認してください。'
+            return f'{filename} は検索 focus に関連する notebook です。関連箇所は提示されたセル番号を確認してください。'
         raise tornado.web.HTTPError(400, reason=f'Unknown provider: {provider}')
+
+    def _shape_notebook_metadata(self, doc):
+        return {
+            key: doc[key]
+            for key in ['owner', 'server', 'mtime', 'ctime', 'atime']
+            if key in doc
+        }
 
     async def _shape_notebook_result(self, db, search_id, index, doc, query, focus, no_filter):
         reference_id = f'{search_id}/r{index + 1}/ref1'
@@ -580,7 +573,8 @@ class NBSearchHandler(APIHandler):
             'referenceId': reference_id,
         }]
         return {
-            'path': doc['filename'],
+            'filename': doc['filename'],
+            **self._shape_notebook_metadata(doc),
             'summary': await self._summarize_result(
                 focus,
                 doc['filename'],
