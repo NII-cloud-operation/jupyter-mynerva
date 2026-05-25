@@ -45,17 +45,15 @@ const ACTION_SCHEMAS: Record<
   },
   searchNotebooks: {
     required: ['query', 'focus'],
-    optional: [
-      'dateFrom',
-      'dateTo',
-      'start',
-      'limit',
-      'sort'
-    ]
+    optional: ['dateFrom', 'dateTo', 'start', 'limit', 'sort']
   },
   getCellsFromSearch: {
     required: ['referenceId'],
     optional: ['start', 'limit']
+  },
+  summaryCellsFromSearch: {
+    required: ['referenceId', 'focus'],
+    optional: []
   },
   // Mutate actions
   insertCell: {

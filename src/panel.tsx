@@ -381,7 +381,7 @@ async function saveSession(
 }
 
 async function callNBSearch(
-  target: 'notebooks' | 'cells-from-search',
+  target: 'notebooks' | 'summary-cells-from-search' | 'cells-from-search',
   action: IAction,
   filterEnabled: boolean
 ): Promise<unknown> {
@@ -927,6 +927,7 @@ const QUERY_ACTION_TYPES = [
   'getCellsFromFile',
   'getOutputFromFile',
   'searchNotebooks',
+  'summaryCellsFromSearch',
   'getCellsFromSearch',
   'listHelp',
   'help'
@@ -1548,6 +1549,19 @@ function MynervaComponent({
         );
         result = JSON.stringify(
           { type: 'searchNotebooks', result: searchResult },
+          null,
+          2
+        );
+        break;
+      }
+      case 'summaryCellsFromSearch': {
+        const searchResult = await callNBSearch(
+          'summary-cells-from-search',
+          action,
+          filterEnabled
+        );
+        result = JSON.stringify(
+          { type: 'summaryCellsFromSearch', result: searchResult },
           null,
           2
         );

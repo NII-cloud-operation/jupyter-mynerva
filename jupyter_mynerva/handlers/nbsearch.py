@@ -57,6 +57,7 @@ _NBSEARCH_REFERENCE_CELL_COUNT = 10000
 _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES = 100 * 1024
 _NBSEARCH_CELLS_PAGE_LIMIT_BYTES = 100 * 1024
 _NBSEARCH_CELLS_MAX_LIMIT = 50
+_NBSEARCH_CELL_SUMMARY_LIMIT_BYTES = 100 * 1024
 
 
 def _solr_phrase(value):
@@ -192,6 +193,30 @@ def _prepare_summary_cells(cells):
     return summary_cells
 
 
+def _prepare_cells_summary_input(cells_result, budget=_NBSEARCH_CELL_SUMMARY_LIMIT_BYTES):
+    if not isinstance(cells_result, dict):
+        return cells_result, 'unknown'
+    cells = cells_result.get('cells')
+    if not isinstance(cells, list):
+        return cells_result, 'unknown'
+
+    total = len(cells)
+    if _estimate_json_size(cells, budget) <= budget:
+        return cells, f'full {total}/{total} cells'
+
+    source_cells = [_source_only_cell(cell) for cell in cells]
+    if _estimate_json_size(source_cells, budget) <= budget:
+        return source_cells, f'full {total}/{total} cells'
+
+    selected = []
+    for cell in source_cells:
+        candidate = selected + [cell]
+        if selected and _estimate_json_size(candidate, budget) > budget:
+            break
+        selected = candidate
+    return selected, f'sampled {len(selected)}/{total} cells'
+
+
 def _parse_non_negative_int(value, name, default=0):
     if value is None:
         return default
@@ -253,6 +278,8 @@ class NBSearchHandler(APIHandler):
         try:
             if target == 'cells-from-search':
                 result = await self._get_cells_from_search(data)
+            elif target == 'summary-cells-from-search':
+                result = await self._summary_cells_from_search(data)
             else:
                 result = await self._search_notebooks(target, data)
         except tornado.web.HTTPError as e:
@@ -407,6 +434,42 @@ class NBSearchHandler(APIHandler):
             'result': result,
         }
 
+    async def _summary_cells_from_search(self, data):
+        reference_id = data.get('referenceId')
+        if not reference_id:
+            raise tornado.web.HTTPError(400, reason='referenceId is required')
+        if reference_id not in _NBSEARCH_REFERENCE_CACHE:
+            raise tornado.web.HTTPError(404, reason='search reference not found')
+        if not data.get('focus'):
+            raise tornado.web.HTTPError(400, reason='focus is required')
+
+        db = self._create_db()
+        reference = _NBSEARCH_REFERENCE_CACHE[reference_id]
+        cells = await self._get_search_reference_cells(
+            db,
+            reference,
+            bool(data.get('noFilter')),
+        )
+        summary_input, coverage = _prepare_cells_summary_input(cells)
+        cell_count = len(cells.get('cells', [])) if isinstance(cells, dict) and isinstance(cells.get('cells'), list) else 0
+        return {
+            'type': 'summaryCellsFromSearch',
+            'referenceId': reference_id,
+            'filename': reference['filename'],
+            'cellCount': cell_count,
+            'coverage': coverage,
+            'summary': await self._summarize_search_cells(
+                data['focus'],
+                reference['filename'],
+                summary_input,
+                coverage,
+            ),
+            'readAction': {
+                'type': 'getCellsFromSearch',
+                'referenceId': reference_id,
+            },
+        }
+
     async def _download_notebook_to_tempfile(self, db, notebook_id):
         fd, path = tempfile.mkstemp(suffix='.ipynb', prefix='nbsearch-')
         try:
@@ -491,7 +554,7 @@ class NBSearchHandler(APIHandler):
                 'role': 'system',
                 'content': (
                     'Summarize why this notebook is relevant to the user focus. '
-                    'Use only the provided privacy-filtered cells. '
+                    'Use only the provided cells, shared according to the user-approved Privacy filter setting. '
                     'Include the supporting cell index or range in the sentence, '
                     'such as "セル12-14では...". '
                     'Return one concise Japanese sentence.'
@@ -556,6 +619,84 @@ class NBSearchHandler(APIHandler):
             return f'{filename} は検索 focus に関連する notebook です。関連箇所は提示されたセル番号を確認してください。'
         raise tornado.web.HTTPError(400, reason=f'Unknown provider: {provider}')
 
+    async def _summarize_search_cells(self, focus, filename, cells, coverage):
+        from jupyter_mynerva import routes
+
+        config = await routes.load_config()
+        provider, model, api_key, base_url = await routes.resolve_chat_config(config)
+        messages = [
+            {
+                'role': 'system',
+                'content': (
+                    'Summarize the provided notebook cells for the user focus. '
+                    'The cells are shared according to the user-approved Privacy filter setting. '
+                    'The summary is used to decide which raw cells to read next. '
+                    'Always include relevant cell indexes or ranges in the summary. '
+                    'Use the format "セル12" for one cell and "セル12-18" for a range. '
+                    'Do not return raw cell contents. '
+                    'Return one concise Japanese paragraph.'
+                ),
+            },
+            {
+                'role': 'user',
+                'content': json.dumps({
+                    'focus': focus,
+                    'filename': filename,
+                    'coverage': coverage,
+                    'cells': cells,
+                }, ensure_ascii=False),
+            },
+        ]
+        if provider == 'openai':
+            kwargs = {'api_key': api_key or ''}
+            if base_url:
+                kwargs['base_url'] = base_url
+            client = routes.AsyncOpenAI(**kwargs)
+            try:
+                response = await client.responses.create(model=model, input=messages)
+            except Exception:
+                self.log.exception(
+                    'Failed to summarize nbsearch cells: provider=%s model=%s filename=%s',
+                    provider,
+                    model,
+                    filename,
+                )
+                raise
+            return response.output_text.strip()
+        if provider == 'enki-gate':
+            enki_token = config.get('enkiGateToken')
+            enki_url = config.get('enkiGateUrl')
+            enki_model = config.get('enkiGateModel', '')
+            client = routes.AsyncOpenAI(api_key=enki_token, base_url=enki_url.rstrip('/') + '/v1')
+            try:
+                response = await client.responses.create(model=enki_model, input=messages)
+            except Exception:
+                self.log.exception(
+                    'Failed to summarize nbsearch cells: provider=%s model=%s filename=%s',
+                    provider,
+                    enki_model,
+                    filename,
+                )
+                raise
+            return response.output_text.strip()
+        if provider == 'anthropic':
+            client = routes.AsyncAnthropic(api_key=api_key)
+            kwargs = routes._build_anthropic_params(messages)
+            try:
+                response = await client.messages.create(model=model, **kwargs)
+            except Exception:
+                self.log.exception(
+                    'Failed to summarize nbsearch cells: provider=%s model=%s filename=%s',
+                    provider,
+                    model,
+                    filename,
+                )
+                raise
+            return ''.join(block.text for block in response.content if block.type == 'text').strip()
+        if provider == 'echo':
+            return f'{filename} は focus に関連するセル範囲を含みます。要約内のセル番号を使って getCellsFromSearch で詳細を確認してください。'
+        raise tornado.web.HTTPError(400, reason=f'Unknown provider: {provider}')
+
     def _shape_notebook_metadata(self, doc):
         return {
             key: doc[key]
@@ -569,7 +710,7 @@ class NBSearchHandler(APIHandler):
         _NBSEARCH_REFERENCE_CACHE[reference_id] = reference
         cells = await self._get_search_reference_cells(db, reference, no_filter)
         references = [{
-            'type': 'getCellsFromSearch',
+            'type': 'summaryCellsFromSearch',
             'referenceId': reference_id,
         }]
         return {

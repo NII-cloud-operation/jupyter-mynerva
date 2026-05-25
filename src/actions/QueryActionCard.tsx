@@ -11,7 +11,9 @@ interface IQueryActionCardProps {
 }
 
 function getActionLabel(action: IQueryAction): string {
-  const searchParts = (searchAction: Extract<IQueryAction, { type: 'searchNotebooks' }>): string[] => {
+  const searchParts = (
+    searchAction: Extract<IQueryAction, { type: 'searchNotebooks' }>
+  ): string[] => {
     const parts = [`query: ${searchAction.query}`];
     if (searchAction.sort) {
       parts.push(`sort: ${searchAction.sort}`);
@@ -45,7 +47,9 @@ function getActionLabel(action: IQueryAction): string {
     case 'getOutputFromFile':
       return `Get Output from ${action.path}: ${JSON.stringify(action.query)}`;
     case 'searchNotebooks':
-      return `Search Notebooks: ${searchParts(action).join(', ')} (summarize filtered cells with LLM)`;
+      return `Search Notebooks: ${searchParts(action).join(', ')} (summarize shared cells with LLM)`;
+    case 'summaryCellsFromSearch':
+      return `Summarize Search Cells: ${action.referenceId} (focus: ${action.focus})`;
     case 'getCellsFromSearch':
       return `Get Cells from Search: ${action.referenceId}${action.start !== undefined ? ` (start: ${action.start})` : ''}${action.limit ? ` (limit: ${action.limit})` : ''}`;
     case 'listHelp':

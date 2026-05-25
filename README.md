@@ -133,14 +133,15 @@ Query actions show a preview before sending to LLM. Users can choose to apply pr
 
 ### Query: Indexed Notebooks
 
-When [nbsearch](https://github.com/NII-cloud-operation/nbsearch) is configured for the Jupyter server, Mynerva can search the nbsearch `jupyter-notebook` index and then read matched notebook payloads through nblibram with privacy filtering enabled.
+When [nbsearch](https://github.com/NII-cloud-operation/nbsearch) is configured for the Jupyter server, Mynerva can search the nbsearch `jupyter-notebook` index and then read matched notebook payloads through nblibram. The panel's Privacy filter checkbox controls whether those cells are filtered before sharing; filtering is enabled by default.
 
-| Action               | Parameters                              | Description                                      |
-| -------------------- | --------------------------------------- | ------------------------------------------------ |
-| `searchNotebooks`    | `query`, `focus`, `sort?`, `limit?`     | Search indexed notebooks and return summaries    |
-| `getCellsFromSearch` | `referenceId`, `start?`, `limit?`       | Read filtered cells from a search result         |
+| Action                   | Parameters                          | Description                                   |
+| ------------------------ | ----------------------------------- | --------------------------------------------- |
+| `searchNotebooks`        | `query`, `focus`, `sort?`, `limit?` | Search indexed notebooks and return summaries |
+| `summaryCellsFromSearch` | `referenceId`, `focus`              | Summarize cells and identify cell ranges      |
+| `getCellsFromSearch`     | `referenceId`, `start?`, `limit?`   | Read cells from a search result               |
 
-`searchNotebooks.query` is a Solr/Lucene query string sent to nbsearch. For example, use `filename:*Search*` to find notebooks whose filename contains `Search`, or `*:*` with `sort: "mtime desc"` to fetch recently modified notebooks. Search results return metadata such as `filename`, timestamps, summaries, and references; raw cells are fetched only through `getCellsFromSearch`.
+`searchNotebooks.query` is a Solr/Lucene query string sent to nbsearch. For example, use `filename:*Search*` to find notebooks whose filename contains `Search`, or `*:*` with `sort: "mtime desc"` to fetch recently modified notebooks. Search results return metadata such as `filename`, timestamps, summaries, and references to `summaryCellsFromSearch`. Use `summaryCellsFromSearch` to locate relevant cell ranges in a large notebook, then use `getCellsFromSearch` to fetch the necessary raw cells under the approved Privacy filter setting.
 
 ### Query Syntax
 

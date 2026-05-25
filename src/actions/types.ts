@@ -22,6 +22,7 @@ export type IQueryAction =
   | IGetCellsFromFileAction
   | IGetOutputFromFileAction
   | ISearchNotebooksAction
+  | ISummaryCellsFromSearchAction
   | IGetCellsFromSearchAction
   | IListHelpAction
   | IHelpDetailAction;
@@ -107,6 +108,12 @@ export interface IGetCellsFromSearchAction {
   referenceId: string;
   start?: number;
   limit?: number;
+}
+
+export interface ISummaryCellsFromSearchAction {
+  type: 'summaryCellsFromSearch';
+  referenceId: string;
+  focus: string;
 }
 
 export interface IListHelpAction {

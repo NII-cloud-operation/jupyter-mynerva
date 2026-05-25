@@ -1361,7 +1361,12 @@ def setup_route_handlers(web_app):
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
-    nbsearch_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nbsearch', '(notebooks|cells-from-search)')
+    nbsearch_pattern = url_path_join(
+        base_url,
+        'jupyter-mynerva',
+        'nbsearch',
+        '(notebooks|summary-cells-from-search|cells-from-search)',
+    )
     enki_device_flow_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows')
     enki_device_flow_poll_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows', '([^/]+)', 'poll')
     handlers = [

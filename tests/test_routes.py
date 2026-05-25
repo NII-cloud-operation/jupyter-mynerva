@@ -44,11 +44,13 @@ from jupyter_mynerva.routes import (
 from jupyter_mynerva.echo_agent import chat_echo
 from jupyter_mynerva.handlers.nbsearch import (
     _NBSEARCH_CELLS_PAGE_LIMIT_BYTES,
+    _NBSEARCH_REFERENCE_CACHE,
     NBSearchHandler,
     _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES,
     _build_nbsearch_filter_queries,
     _build_nbsearch_query,
     _paginate_cells_result,
+    _prepare_cells_summary_input,
     _prepare_summary_cells,
 )
 
@@ -433,12 +435,96 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
         'summary': 'focus に関連する notebook です。',
         'references': [
             {
-                'type': 'getCellsFromSearch',
+                'type': 'summaryCellsFromSearch',
                 'referenceId': result['results'][0]['references'][0]['referenceId'],
             },
         ],
     }
     assert result['results'][0]['references'][0]['referenceId'].endswith('/ref1')
+
+
+def test_prepare_cells_summary_input_reports_sampled_coverage():
+    cells = {
+        'cells': [
+            {'_index': index, 'cell_type': 'code', 'source': 'print(1)', 'outputs': ['x' * 100]}
+            for index in range(10)
+        ],
+    }
+
+    result, coverage = _prepare_cells_summary_input(cells, budget=500)
+
+    assert coverage.startswith('sampled ')
+    assert coverage.endswith('/10 cells')
+    assert len(result) < 10
+    assert all('outputs' not in cell for cell in result)
+
+
+@pytest.mark.asyncio
+async def test_summary_cells_from_search_returns_locator_summary(monkeypatch):
+    class FakeDB:
+        def __init__(self, config):
+            self.solr_base_url = 'http://solr:8983'
+            self.solr_notebook = 'notebooks'
+            self.solr_basic_auth_username = None
+            self.solr_basic_auth_password = None
+
+    captured = {}
+
+    async def fake_get_search_reference_cells(self, db, reference, no_filter):
+        captured['no_filter'] = no_filter
+        return {
+            'cells': [
+                {'_index': 12, 'cell_type': 'markdown', 'source': 'Galaxy 更新前確認'},
+                {'_index': 13, 'cell_type': 'code', 'source': 'run_update()'},
+            ],
+        }
+
+    async def fake_summarize_search_cells(self, focus, filename, cells, coverage):
+        captured['focus'] = focus
+        captured['filename'] = filename
+        captured['cells'] = cells
+        captured['coverage'] = coverage
+        return 'セル12-13でGalaxy更新前確認と更新処理をしている。'
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+    monkeypatch.setattr(NBSearchHandler, '_get_search_reference_cells', fake_get_search_reference_cells)
+    monkeypatch.setattr(NBSearchHandler, '_summarize_search_cells', fake_summarize_search_cells)
+
+    reference_id = 'search-test/r1/ref1'
+    _NBSEARCH_REFERENCE_CACHE[reference_id] = {
+        'filename': 'galaxy.ipynb',
+        'notebookId': 'notebook',
+        'query': {'start': 0},
+        'count': 10000,
+    }
+    try:
+        handler = _make_nbsearch_handler(
+            {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+        )
+        result = await handler._summary_cells_from_search({
+            'referenceId': reference_id,
+            'focus': 'Galaxy更新の手順を確認したい',
+            'noFilter': True,
+        })
+    finally:
+        _NBSEARCH_REFERENCE_CACHE.pop(reference_id, None)
+
+    assert captured['no_filter'] is True
+    assert captured['focus'] == 'Galaxy更新の手順を確認したい'
+    assert captured['filename'] == 'galaxy.ipynb'
+    assert captured['coverage'] == 'full 2/2 cells'
+    assert result == {
+        'type': 'summaryCellsFromSearch',
+        'referenceId': reference_id,
+        'filename': 'galaxy.ipynb',
+        'cellCount': 2,
+        'coverage': 'full 2/2 cells',
+        'summary': 'セル12-13でGalaxy更新前確認と更新処理をしている。',
+        'readAction': {
+            'type': 'getCellsFromSearch',
+            'referenceId': reference_id,
+        },
+    }
 
 
 @pytest.mark.asyncio
