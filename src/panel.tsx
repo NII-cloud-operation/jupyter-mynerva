@@ -16,6 +16,9 @@ import {
   IQueryAction,
   IMutateAction,
   IListNotebookFilesAction,
+  ISearchNotebooksAction,
+  IGetCellsFromSearchAction,
+  ISummaryCellsFromSearchAction,
   ActionStatus,
   parseRawContent,
   validateActions,
@@ -956,7 +959,7 @@ function isMutateAction(action: IAction): action is IMutateAction {
   return MUTATE_ACTION_TYPES.includes(action.type);
 }
 
-type QueryActionType = 'getToc' | 'getSection' | 'getCells' | 'getOutput';
+type QueryActionType = (typeof QUERY_ACTION_TYPES)[number];
 type MutateActionType = 'insertCell' | 'updateCell' | 'deleteCell' | 'runCell';
 type ActionType = QueryActionType | MutateActionType;
 
@@ -1305,6 +1308,10 @@ function MynervaComponent({
   >(new Map());
   // Auto-approval for file queries: Map<targetPath, Set<fileQueryActionType>>
   const [fileAutoApproved, setFileAutoApproved] = React.useState<
+    Map<string, Set<string>>
+  >(new Map());
+  // Auto-approval for nbsearch queries: Map<query|referenceId, Set<actionType>>
+  const [searchAutoApproved, setSearchAutoApproved] = React.useState<
     Map<string, Set<string>>
   >(new Map());
   // Session management
@@ -1699,8 +1706,18 @@ function MynervaComponent({
     'getOutputFromFile'
   ];
 
+  const SEARCH_QUERY_TYPES = [
+    'searchNotebooks',
+    'summaryCellsFromSearch',
+    'getCellsFromSearch'
+  ];
+
   const isFileQueryAction = (action: IAction): boolean => {
     return FILE_QUERY_TYPES.includes(action.type);
+  };
+
+  const isSearchQueryAction = (action: IAction): boolean => {
+    return SEARCH_QUERY_TYPES.includes(action.type);
   };
 
   const getFileQueryTargetPath = (action: IAction): string => {
@@ -1708,6 +1725,14 @@ function MynervaComponent({
       return (action as IListNotebookFilesAction).path || '';
     }
     return (action as { path: string }).path;
+  };
+
+  const getSearchQueryKey = (action: IAction): string => {
+    if (action.type === 'searchNotebooks') {
+      return (action as ISearchNotebooksAction).query;
+    }
+    return (action as IGetCellsFromSearchAction | ISummaryCellsFromSearchAction)
+      .referenceId;
   };
 
   const addAutoApproval = (action: IAction) => {
@@ -1718,6 +1743,15 @@ function MynervaComponent({
         const types = newMap.get(targetPath) ?? new Set<string>();
         types.add(action.type);
         newMap.set(targetPath, types);
+        return newMap;
+      });
+    } else if (isSearchQueryAction(action)) {
+      const key = getSearchQueryKey(action);
+      setSearchAutoApproved(prev => {
+        const newMap = new Map(prev);
+        const types = newMap.get(key) ?? new Set<string>();
+        types.add(action.type);
+        newMap.set(key, types);
         return newMap;
       });
     } else {
@@ -1736,6 +1770,12 @@ function MynervaComponent({
     if (isFileQueryAction(action)) {
       const targetPath = getFileQueryTargetPath(action);
       const approved = fileAutoApproved.get(targetPath);
+      return approved?.has(action.type) ?? false;
+    }
+
+    if (isSearchQueryAction(action)) {
+      const key = getSearchQueryKey(action);
+      const approved = searchAutoApproved.get(key);
       return approved?.has(action.type) ?? false;
     }
 
@@ -1948,7 +1988,7 @@ function MynervaComponent({
       }
       // If not all auto-approvable, do nothing (show buttons for all)
     }
-  }, [messages, autoApproved, fileAutoApproved]);
+  }, [messages, autoApproved, fileAutoApproved, searchAutoApproved]);
 
   const clearStreamingState = () => {
     setStreamingContent('');
