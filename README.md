@@ -53,7 +53,7 @@ The LLM actively explores—requesting the table of contents, navigating section
                                          │ REST
 ┌────────────────────────────────────────▼────────────────┐
 │  Server Extension (Python)                              │
-│  - LLM proxy (OpenAI / Anthropic / Enki Gate)           │
+│  - LLM proxy (OpenAI / Anthropic / Bedrock / Enki Gate) │
 │  - nblibram CLI proxy (query execution)                 │
 │  - Session storage (.mynerva files)                     │
 │  - Enki Gate device flow authentication                 │
@@ -87,7 +87,7 @@ The LLM actively explores—requesting the table of contents, navigating section
 | Action confirmation | Batch confirmation supported; per-notebook auto-approval available                                 |
 | Mutation validation | Optimistic locking via `_hash`; must read before write                                             |
 | Error handling      | API failure: retry with limit (3). Hash mismatch / user rejection: feedback to LLM, no retry count |
-| LLM providers       | OpenAI (+ compatible endpoints), Anthropic, Enki Gate (device flow auth)                           |
+| LLM providers       | OpenAI (+ compatible endpoints), Anthropic, Amazon Bedrock (Converse API), Enki Gate (device flow) |
 
 ### UI
 
@@ -240,20 +240,36 @@ Administrators can provide default LLM settings via environment variables. Users
 | `MYNERVA_OPENAI_API_KEY`    | Default OpenAI API key                                          |
 | `MYNERVA_OPENAI_BASE_URL`   | Default OpenAI-compatible endpoint (e.g. vLLM, Ollama)          |
 | `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                       |
-| `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai` or `anthropic`)                      |
+| `MYNERVA_BEDROCK_API_KEY`   | Default Amazon Bedrock short-term or long-term API key (bearer) |
+| `MYNERVA_BEDROCK_REGION`    | AWS region for Bedrock requests                                 |
+| `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai`, `anthropic`, or `bedrock`)          |
 | `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, fetched from endpoint if not set) |
 | `MYNERVA_DEFAULTS_ONLY`     | Lock LLM settings to admin defaults (hides settings UI)         |
 
 **Provider auto-detection:**
 
 - If only one API key (or base URL) is set, that provider is automatically selected
-- If both API keys are set, `MYNERVA_DEFAULT_PROVIDER` is required
+- If multiple keys are set, `MYNERVA_DEFAULT_PROVIDER` is required
 - If `MYNERVA_OPENAI_BASE_URL` is set without an API key, the `openai` provider is enabled (for endpoints that don't require authentication)
 - When `MYNERVA_OPENAI_BASE_URL` is set and `MYNERVA_DEFAULT_MODEL` is not, the model list is fetched from the endpoint's `/v1/models`
+- When `MYNERVA_BEDROCK_API_KEY` is set and `MYNERVA_DEFAULT_MODEL` is not, the model list is fetched from Bedrock's `/inference-profiles` in the configured region
 
 **Auto-initialization:** If `~/.mynerva/config.json` doesn't exist and defaults are available, it's automatically created with `useDefault: true`.
 
 **Security note:** API key environment variables are deleted after loading to prevent exposure in notebook cells.
+
+### Amazon Bedrock (Converse API)
+
+The `bedrock` provider streams responses from Bedrock's Converse Stream API at `https://bedrock-runtime.{region}.amazonaws.com` using bearer-token authentication.
+
+To use it:
+
+1. Select "Amazon Bedrock (Converse)" in Settings
+2. Choose the AWS region (default `us-east-1`)
+3. Paste your Bedrock API key
+4. Click the refresh icon next to the model dropdown. The list is populated from Bedrock's `/inference-profiles` API, filtered by the bedrock entry in `jupyter_mynerva/models.json`
+
+Extended thinking (a.k.a reasoning) is enabled automatically for Anthropic-family model IDs (those whose ID contains `claude` or `anthropic`), giving the same UX as the dedicated Anthropic provider.
 
 ### Enki Gate
 
