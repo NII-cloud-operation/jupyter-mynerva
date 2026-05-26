@@ -542,13 +542,23 @@ class ProvidersHandler(APIHandler):
             self.finish(json.dumps({'error': f'Failed to fetch models: {e}'}))
             return
 
+        defaults = None
+        defaults_error = None
+        try:
+            defaults = await get_default_config()
+        except Exception as e:
+            _log.warning('Default config unavailable: %s', e)
+            defaults_error = str(e)
+
         result = {
             'providers': providers,
             'encryption': is_encryption_configured(),
-            'defaults': await get_default_config(),
+            'defaults': defaults,
             'filters': filters,
             'bedrockRegions': _load_bedrock_regions(),
         }
+        if defaults_error:
+            result['defaultsError'] = defaults_error
         if _DEFAULT_CONFIG.get('defaults_only'):
             result['defaultsOnly'] = True
         self.finish(json.dumps(result))

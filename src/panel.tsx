@@ -81,6 +81,7 @@ interface IProvidersResponse {
   encryption: boolean;
   defaults: IDefaultConfig | null;
   defaultsOnly?: boolean;
+  defaultsError?: string;
   bedrockRegions: IBedrockRegion[];
 }
 
@@ -360,7 +361,7 @@ interface ISettingsViewProps {
   bedrockRegions: IBedrockRegion[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
-  defaultsUnavailable: boolean;
+  defaultsUnavailable: string | null;
   onSave: (config: IConfig) => void;
   warning?: string;
 }
@@ -568,7 +569,7 @@ function SettingsView({
   warning
 }: ISettingsViewProps): React.ReactElement {
   const [useDefault, setUseDefault] = React.useState(
-    defaultsUnavailable ? false : (config.useDefault ?? false)
+    defaultsUnavailable !== null ? false : (config.useDefault ?? false)
   );
   const initialProvider = providers.some(p => p.id === config.provider)
     ? config.provider
@@ -577,9 +578,7 @@ function SettingsView({
     providers.find(p => p.id === initialProvider)?.models || [];
   const [provider, setProvider] = React.useState(initialProvider);
   const [model, setModel] = React.useState(
-    config.model && initialModels.includes(config.model)
-      ? config.model
-      : initialModels[0] || ''
+    config.model || initialModels[0] || ''
   );
   const [apiKey, setApiKey] = React.useState(config.apiKey);
   const [openaiBaseUrl, setOpenaiBaseUrl] = React.useState(
@@ -683,11 +682,8 @@ function SettingsView({
 
   return (
     <div className="jp-Mynerva-settings">
-      {defaultsUnavailable && (
-        <div className="jp-Mynerva-settings-warning">
-          Default settings are no longer available. Please configure your own
-          API key.
-        </div>
+      {defaultsUnavailable !== null && (
+        <div className="jp-Mynerva-settings-error">{defaultsUnavailable}</div>
       )}
       {defaults && (
         <div className="jp-Mynerva-settings-field jp-Mynerva-settings-checkbox">
@@ -813,7 +809,7 @@ function SettingsView({
         <button
           className="jp-Mynerva-settings-save"
           onClick={handleSave}
-          disabled={saving}
+          disabled={saving || !model}
         >
           {saving ? 'Saving...' : 'Save'}
         </button>
@@ -1187,6 +1183,7 @@ function MynervaComponent({
   );
   const [encryption, setEncryption] = React.useState(false);
   const [defaults, setDefaults] = React.useState<IDefaultConfig | null>(null);
+  const [defaultsError, setDefaultsError] = React.useState<string | null>(null);
   const [defaultsOnly, setDefaultsOnly] = React.useState(false);
   const [config, setConfig] = React.useState<IConfig | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
@@ -1227,6 +1224,9 @@ function MynervaComponent({
         setBedrockRegions(providersRes.bedrockRegions || []);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
+        if (providersRes.defaultsError) {
+          setDefaultsError(providersRes.defaultsError);
+        }
         if (providersRes.defaultsOnly) {
           setDefaultsOnly(true);
         }
@@ -1242,13 +1242,15 @@ function MynervaComponent({
           // Show settings if:
           // - no API key (and no base URL) and not using defaults, OR
           // - useDefault is set but defaults are not available
-          const defaultsUnavailable = cfg.useDefault && !providersRes.defaults;
+          const needsSettings =
+            (cfg.useDefault && !providersRes.defaults) ||
+            providersRes.defaultsError;
           const enkiGateValid =
             cfg.enkiGateToken &&
             cfg.enkiGateExpiresAt &&
             cfg.enkiGateExpiresAt > Date.now();
           const hasAuth = cfg.apiKey || cfg.openaiBaseUrl || enkiGateValid;
-          if ((!hasAuth && !cfg.useDefault) || defaultsUnavailable) {
+          if ((!hasAuth && !cfg.useDefault) || needsSettings) {
             setShowSettings(true);
           }
         }
@@ -2122,7 +2124,13 @@ function MynervaComponent({
           bedrockRegions={bedrockRegions}
           encryption={encryption}
           defaults={defaults}
-          defaultsUnavailable={!!(config?.useDefault && !defaults)}
+          defaultsUnavailable={
+            defaultsError
+              ? `Default settings unavailable: ${defaultsError}`
+              : config?.useDefault && !defaults
+                ? 'Default settings are no longer available. Please configure your own API key.'
+                : null
+          }
           onSave={handleConfigSave}
           warning={config?.configWarning || config?.decryptError}
         />
