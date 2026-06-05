@@ -43,6 +43,9 @@ function queryToString(query: ICellQuery): string {
   if ('id' in query) {
     return `id:${query.id}`;
   }
+  if ('meme' in query) {
+    return `meme:${query.meme}`;
+  }
   if ('contains' in query) {
     return `contains:${query.contains}`;
   }

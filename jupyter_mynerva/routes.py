@@ -33,6 +33,7 @@ import tornado
 
 from .echo_agent import chat_echo
 from .eventstream import EventStreamParser
+from .handlers.nbsearch import NBSearchHandler, has_nbsearch_config
 
 
 # Lazy import wrappers for heavy SDKs. The actual modules are loaded only on
@@ -524,6 +525,12 @@ async def _build_providers_with_models(config=None):
 
 
 class ProvidersHandler(APIHandler):
+    def _handler_config(self):
+        config = getattr(self, 'config', None)
+        if config is not None:
+            return config
+        return self.settings.get('config')
+
     @tornado.web.authenticated
     async def get(self):
         try:
@@ -556,6 +563,7 @@ class ProvidersHandler(APIHandler):
             'defaults': defaults,
             'filters': filters,
             'bedrockRegions': _load_bedrock_regions(),
+            'nbsearchAvailable': has_nbsearch_config(self._handler_config())
         }
         if defaults_error:
             result['defaultsError'] = defaults_error
@@ -1492,6 +1500,12 @@ def setup_route_handlers(web_app):
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
+    nbsearch_pattern = url_path_join(
+        base_url,
+        'jupyter-mynerva',
+        'nbsearch',
+        '(notebooks|summary-cells-from-search|cells-from-search)',
+    )
     enki_device_flow_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows')
     enki_device_flow_poll_pattern = url_path_join(base_url, 'jupyter-mynerva', 'enki-gate', 'device-flows', '([^/]+)', 'poll')
     handlers = [
@@ -1504,6 +1518,7 @@ def setup_route_handlers(web_app):
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
+        (nbsearch_pattern, NBSearchHandler),
         (enki_device_flow_pattern, EnkiGateDeviceFlowHandler),
         (enki_device_flow_poll_pattern, EnkiGateDeviceFlowPollHandler)
     ]

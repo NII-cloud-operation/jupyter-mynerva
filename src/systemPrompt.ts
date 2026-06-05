@@ -3,6 +3,7 @@ const QUERY_SYNTAX = `Query syntax:
   { "contains": "text" } - substring match
   { "start": N } - cell index
   { "id": "cellId" } - cell ID
+  { "meme": "UUID" } - nblineage cell meme ID
   { "active": true } - currently focused cell (active notebook only)
   { "selected": true } - selected cells (active notebook only)`;
 
@@ -67,6 +68,27 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     required: ['path', 'query'],
     optional: [],
     usesQuery: true
+  },
+  searchNotebooks: {
+    description:
+      'Search indexed notebooks and return focus-oriented summaries with search references',
+    required: ['query', 'focus'],
+    optional: ['dateFrom', 'dateTo', 'start', 'limit', 'sort'],
+    usesQuery: false
+  },
+  getCellsFromSearch: {
+    description:
+      'Read cells from a search reference using the approved Privacy filter setting',
+    required: ['referenceId'],
+    optional: ['start', 'limit'],
+    usesQuery: false
+  },
+  summaryCellsFromSearch: {
+    description:
+      'Summarize cells from a search reference and identify cell ranges to read',
+    required: ['referenceId', 'focus'],
+    optional: [],
+    usesQuery: false
   },
   insertCell: {
     description: 'Insert new cell',
