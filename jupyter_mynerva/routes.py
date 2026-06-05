@@ -899,9 +899,10 @@ def _build_bedrock_converse_body(messages, model, tools=None):
                 api_messages.append({'role': 'user',
                                      'content': [{'text': m.get('content', '')}]})
 
+    # No maxTokens: Converse defaults it to the model's own maximum, so we never
+    # exceed a model-specific ceiling (e.g. Nova Lite caps at 10000).
     body = {
-        'messages': api_messages,
-        'inferenceConfig': {'maxTokens': 32000}
+        'messages': api_messages
     }
     if tools:
         body['toolConfig'] = {
@@ -920,7 +921,7 @@ def _build_bedrock_converse_body(messages, model, tools=None):
     model_lower = model.lower()
     if 'claude' in model_lower or 'anthropic' in model_lower:
         body['additionalModelRequestFields'] = {
-            'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+            'thinking': _anthropic_thinking_config(model)
         }
     return body
 

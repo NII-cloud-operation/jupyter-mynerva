@@ -1724,13 +1724,25 @@ def test_build_bedrock_converse_body_basic():
         {'text': 'You are helpful.'},
         {'text': 'Be concise.'},
     ]
-    assert body['inferenceConfig'] == {'maxTokens': 32000}
+    # maxTokens is omitted so Converse uses each model's own maximum.
+    assert 'inferenceConfig' not in body
     # User content is a plain text block (no action annotations).
     assert body['messages'][0] == {'role': 'user', 'content': [{'text': 'Hello'}]}
     assert body['messages'][1] == {'role': 'assistant', 'content': [{'text': 'Hi!'}]}
-    # Claude in model id -> thinking enabled
+    # Claude 4.5 in model id -> conservative budget_tokens form.
     assert body['additionalModelRequestFields'] == {
         'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+    }
+
+
+def test_build_bedrock_converse_body_adaptive_for_4_6_plus():
+    # Claude 4.6+ requires adaptive thinking; enabled/budget_tokens 400s.
+    body = _build_bedrock_converse_body(
+        [{'role': 'user', 'content': 'Hi'}],
+        model='jp.anthropic.claude-sonnet-4-6',
+    )
+    assert body['additionalModelRequestFields'] == {
+        'thinking': {'type': 'adaptive'}
     }
 
 
