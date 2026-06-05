@@ -28,13 +28,18 @@ export interface ISelectedQuery {
   selected: true;
 }
 
+export interface IMemeQuery {
+  meme: string;
+}
+
 export type ICellQuery =
   | IMatchQuery
   | IContainsQuery
   | IStartQuery
   | IIdQuery
   | IActiveQuery
-  | ISelectedQuery;
+  | ISelectedQuery
+  | IMemeQuery;
 
 /**
  * Cell data returned by mutation operations
@@ -128,6 +133,18 @@ export class ContextEngine {
         }
       }
       throw new Error(`No cell with id: ${query.id}`);
+    }
+    if ('meme' in query) {
+      for (let i = 0; i < model.cells.length; i++) {
+        const metadata = model.cells.get(i).metadata as any;
+        const cellMeme = metadata?.lc_cell_meme as
+          | { current?: string }
+          | undefined;
+        if (cellMeme?.current === query.meme) {
+          return i;
+        }
+      }
+      throw new Error(`No cell with meme: ${query.meme}`);
     }
     if ('contains' in query) {
       for (let i = 0; i < model.cells.length; i++) {

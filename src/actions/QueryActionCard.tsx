@@ -11,6 +11,22 @@ interface IQueryActionCardProps {
 }
 
 function getActionLabel(action: IQueryAction): string {
+  const searchParts = (
+    searchAction: Extract<IQueryAction, { type: 'searchNotebooks' }>
+  ): string[] => {
+    const parts = [`query: ${searchAction.query}`];
+    if (searchAction.sort) {
+      parts.push(`sort: ${searchAction.sort}`);
+    }
+    if (searchAction.limit !== undefined) {
+      parts.push(`limit: ${searchAction.limit}`);
+    }
+    if (searchAction.start !== undefined) {
+      parts.push(`start: ${searchAction.start}`);
+    }
+    return parts;
+  };
+
   switch (action.type) {
     case 'getToc':
       return 'Get Table of Contents';
@@ -30,6 +46,12 @@ function getActionLabel(action: IQueryAction): string {
       return `Get Cells from ${action.path}: ${JSON.stringify(action.query)}${action.count ? ` (count: ${action.count})` : ''}`;
     case 'getOutputFromFile':
       return `Get Output from ${action.path}: ${JSON.stringify(action.query)}`;
+    case 'searchNotebooks':
+      return `Search Notebooks: ${searchParts(action).join(', ')} (summarize shared cells with LLM)`;
+    case 'summaryCellsFromSearch':
+      return `Summarize Search Cells: ${action.referenceId} (focus: ${action.focus})`;
+    case 'getCellsFromSearch':
+      return `Get Cells from Search: ${action.referenceId}${action.start !== undefined ? ` (start: ${action.start})` : ''}${action.limit ? ` (limit: ${action.limit})` : ''}`;
     case 'listHelp':
       return 'Show available actions';
     case 'help':

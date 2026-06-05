@@ -1,10 +1,13 @@
 import json
 import logging
 import os
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import tornado.web
 from cryptography.fernet import Fernet
+from tornado.httputil import HTTPServerRequest
 
 from jupyter_mynerva.routes import (
     encrypt_api_key,
@@ -39,6 +42,17 @@ from jupyter_mynerva.routes import (
     chat_bedrock_converse,
 )
 from jupyter_mynerva.echo_agent import chat_echo
+from jupyter_mynerva.handlers.nbsearch import (
+    _NBSEARCH_CELLS_PAGE_LIMIT_BYTES,
+    _NBSEARCH_REFERENCE_CACHE,
+    NBSearchHandler,
+    _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES,
+    _build_nbsearch_filter_queries,
+    _build_nbsearch_query,
+    _paginate_cells_result,
+    _prepare_cells_summary_input,
+    _prepare_summary_cells,
+)
 
 
 
@@ -197,6 +211,447 @@ def test_notebook_store_eviction_warns_on_missing_file(tmp_path, caplog):
         store['b.ipynb'] = str(tmp_path / 'b.ipynb')
 
     assert any('Failed to remove store file' in r.message for r in caplog.records)
+
+
+# --- nbsearch query helpers ---
+
+class _FakeConnection:
+    def set_close_callback(self, callback):
+        pass
+
+
+def _make_nbsearch_handler(config):
+    app = tornado.web.Application([], config=config)
+    request = HTTPServerRequest(method='POST', uri='/jupyter-mynerva/nbsearch/notebooks')
+    request.connection = _FakeConnection()
+    return NBSearchHandler(app, request)
+
+
+def test_build_nbsearch_query_uses_raw_solr_query():
+    query = _build_nbsearch_query(
+        {
+            'query': 'filename:*BinderHub* AND source__markdown__heading_1:構築',
+        }
+    )
+    assert query == 'filename:*BinderHub* AND source__markdown__heading_1:構築'
+
+
+def test_build_nbsearch_filter_queries_uses_normalized_datetime_range():
+    filters = _build_nbsearch_filter_queries(
+        {
+            'dateFrom': '2026-01-01',
+            'dateTo': '2026-01-31',
+            'dateTimeFrom': '2025-12-31T15:00:00.000Z',
+            'dateTimeTo': '2026-01-31T15:00:00.000Z',
+        },
+        {
+            'owner': 'owner',
+            'filename': 'filename',
+            'mtime': 'mtime',
+        },
+    )
+    assert filters == [
+        'mtime:[2025-12-31T15:00:00.000Z TO 2026-01-31T15:00:00.000Z]',
+        '-mtime:"2026-01-31T15:00:00.000Z"',
+    ]
+
+
+def test_prepare_summary_cells_keeps_full_cells_under_budget():
+    cells = [{
+        'referenceId': 'search/r1/ref1',
+        'cells': {
+            'cells': [{
+                'cell_type': 'code',
+                'source': ['print(1)'],
+                'outputs': [{'text': ['small output']}],
+                'metadata': {'lc_cell_meme': {'current': 'meme'}},
+                '_hash': 'hash',
+            }],
+        },
+    }]
+
+    assert _prepare_summary_cells(cells) == cells
+
+
+def test_prepare_summary_cells_strips_outputs_and_metadata_over_budget():
+    cells = [{
+        'referenceId': 'search/r1/ref1',
+        'cells': {
+            'cells': [{
+                '_index': 10,
+                'cell_type': 'code',
+                'source': ['print(1)'],
+                'outputs': [{'text': ['x' * _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES]}],
+                'metadata': {'lc_cell_meme': {'current': 'meme'}},
+                'execution_count': 1,
+                '_hash': 'hash',
+            }],
+            'error': 'partial',
+        },
+    }]
+
+    assert _prepare_summary_cells(cells) == [{
+        'referenceId': 'search/r1/ref1',
+        'cells': {
+            'cells': [{
+                '_index': 10,
+                'cell_type': 'code',
+                'source': ['print(1)'],
+            }],
+            'error': 'partial',
+        },
+    }]
+
+
+def test_paginate_cells_result_uses_budget_and_next_start():
+    result = _paginate_cells_result(
+        {
+            'cells': [
+                {'_index': 0, 'source': ['a']},
+                {'_index': 1, 'source': ['x' * _NBSEARCH_CELLS_PAGE_LIMIT_BYTES]},
+                {'_index': 2, 'source': ['c']},
+            ],
+        },
+        start=0,
+    )
+
+    assert result == {
+        'cells': [{'_index': 0, 'source': ['a']}],
+        'total': 3,
+        'hasMore': True,
+        'nextStart': 1,
+    }
+
+
+def test_paginate_cells_result_honors_start_and_limit():
+    result = _paginate_cells_result(
+        {
+            'cells': [
+                {'_index': 0, 'source': ['a']},
+                {'_index': 1, 'source': ['b']},
+                {'_index': 2, 'source': ['c']},
+            ],
+        },
+        start=1,
+        limit=1,
+    )
+
+    assert result == {
+        'cells': [{'_index': 1, 'source': ['b']}],
+        'total': 3,
+        'hasMore': True,
+        'nextStart': 2,
+    }
+
+
+async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
+    class FakeDB:
+        solr_base_url = 'http://solr:8983'
+        solr_basic_auth_username = ''
+        solr_basic_auth_password = ''
+        solr_notebook = 'jupyter-notebook'
+
+        def __init__(self, config):
+            self.config = config
+
+    response = MagicMock()
+    response.code = 200
+    response.body = json.dumps({
+        'response': {
+            'numFound': 1,
+            'start': 0,
+            'docs': [{
+                'id': 'notebook',
+                'filename': 'foo.ipynb',
+                'owner': 'alice',
+                'server': 'http://localhost:8000/',
+                'mtime': '2026-05-01T00:00:00Z',
+                'ctime': '2026-04-30T00:00:00Z',
+                'atime': '2026-05-02T00:00:00Z',
+                'source__markdown__heading': '## Data',
+                'source__markdown__heading_count': '1',
+                'score': 1.0,
+            }],
+        },
+    }).encode()
+    client = MagicMock()
+    client.fetch = AsyncMock(return_value=response)
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.AsyncHTTPClient', lambda: client)
+    async def fake_get_search_reference_cells(self, db, reference, no_filter):
+        assert reference['query'] == {'start': 0}
+        assert reference['count'] >= 10000
+        return {'cells': [{'cell_type': 'code', 'source': ['print(1)']}]}
+
+    async def fake_summarize_result(self, focus, path, cells):
+        return 'focus に関連する notebook です。'
+
+    monkeypatch.setattr(NBSearchHandler, '_get_search_reference_cells', fake_get_search_reference_cells)
+    monkeypatch.setattr(NBSearchHandler, '_summarize_result', fake_summarize_result)
+
+    handler = _make_nbsearch_handler(
+        {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+    )
+    result = await handler._search_notebooks(
+        'notebooks',
+        {
+            'query': 'filename:*foo* AND pandas',
+            'focus': 'pandas usage',
+            'dateFrom': '2026-05-01',
+            'dateTo': '2026-05-01',
+            'dateTimeFrom': '2026-04-30T15:00:00.000Z',
+            'dateTimeTo': '2026-05-01T15:00:00.000Z',
+            'limit': 5,
+            'sort': 'mtime desc',
+        },
+    )
+
+    request = client.fetch.call_args[0][0]
+    requested_url = request.url
+    assert '/solr/jupyter-notebook/select?' in requested_url
+    params = parse_qs(urlparse(requested_url).query)
+    assert 'group' not in params
+    assert 'group.field' not in params
+    assert params['q'] == ['filename:*foo* AND pandas']
+    assert params['fl'][0] == (
+        'id,filename,owner,server,mtime,ctime,atime,source__markdown__heading,'
+        'source__markdown__heading_count,lc_cell_memes,lc_cell_meme__execution_end_time,score'
+    )
+    assert params['fq'] == [
+        'mtime:[2026-04-30T15:00:00.000Z TO 2026-05-01T15:00:00.000Z]',
+        '-mtime:"2026-05-01T15:00:00.000Z"',
+    ]
+    assert params['sort'] == ['mtime desc']
+    assert result['focus'] == 'pandas usage'
+    assert result['query'] == 'filename:*foo* AND pandas'
+    assert result['results'][0] == {
+        'filename': 'foo.ipynb',
+        'owner': 'alice',
+        'server': 'http://localhost:8000/',
+        'mtime': '2026-05-01T00:00:00Z',
+        'ctime': '2026-04-30T00:00:00Z',
+        'atime': '2026-05-02T00:00:00Z',
+        'summary': 'focus に関連する notebook です。',
+        'references': [
+            {
+                'type': 'summaryCellsFromSearch',
+                'referenceId': result['results'][0]['references'][0]['referenceId'],
+            },
+        ],
+    }
+    assert result['results'][0]['references'][0]['referenceId'].endswith('/ref1')
+
+
+def test_prepare_cells_summary_input_reports_sampled_coverage():
+    cells = {
+        'cells': [
+            {'_index': index, 'cell_type': 'code', 'source': 'print(1)', 'outputs': ['x' * 100]}
+            for index in range(10)
+        ],
+    }
+
+    result, coverage = _prepare_cells_summary_input(cells, budget=500)
+
+    assert coverage.startswith('sampled ')
+    assert coverage.endswith('/10 cells')
+    assert len(result) < 10
+    assert all('outputs' not in cell for cell in result)
+
+
+@pytest.mark.asyncio
+async def test_summary_cells_from_search_returns_locator_summary(monkeypatch):
+    class FakeDB:
+        def __init__(self, config):
+            self.solr_base_url = 'http://solr:8983'
+            self.solr_notebook = 'notebooks'
+            self.solr_basic_auth_username = None
+            self.solr_basic_auth_password = None
+
+    captured = {}
+
+    async def fake_get_search_reference_cells(self, db, reference, no_filter):
+        captured['no_filter'] = no_filter
+        return {
+            'cells': [
+                {'_index': 12, 'cell_type': 'markdown', 'source': 'Galaxy 更新前確認'},
+                {'_index': 13, 'cell_type': 'code', 'source': 'run_update()'},
+            ],
+        }
+
+    async def fake_summarize_search_cells(self, focus, filename, cells, coverage):
+        captured['focus'] = focus
+        captured['filename'] = filename
+        captured['cells'] = cells
+        captured['coverage'] = coverage
+        return 'セル12-13でGalaxy更新前確認と更新処理をしている。'
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+    monkeypatch.setattr(NBSearchHandler, '_get_search_reference_cells', fake_get_search_reference_cells)
+    monkeypatch.setattr(NBSearchHandler, '_summarize_search_cells', fake_summarize_search_cells)
+
+    reference_id = 'search-test/r1/ref1'
+    _NBSEARCH_REFERENCE_CACHE[reference_id] = {
+        'filename': 'galaxy.ipynb',
+        'notebookId': 'notebook',
+        'query': {'start': 0},
+        'count': 10000,
+    }
+    try:
+        handler = _make_nbsearch_handler(
+            {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+        )
+        result = await handler._summary_cells_from_search({
+            'referenceId': reference_id,
+            'focus': 'Galaxy更新の手順を確認したい',
+            'noFilter': True,
+        })
+    finally:
+        _NBSEARCH_REFERENCE_CACHE.pop(reference_id, None)
+
+    assert captured['no_filter'] is True
+    assert captured['focus'] == 'Galaxy更新の手順を確認したい'
+    assert captured['filename'] == 'galaxy.ipynb'
+    assert captured['coverage'] == 'full 2/2 cells'
+    assert result == {
+        'type': 'summaryCellsFromSearch',
+        'referenceId': reference_id,
+        'filename': 'galaxy.ipynb',
+        'cellCount': 2,
+        'coverage': 'full 2/2 cells',
+        'summary': 'セル12-13でGalaxy更新前確認と更新処理をしている。',
+        'readAction': {
+            'type': 'getCellsFromSearch',
+            'referenceId': reference_id,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_nbsearch_notebooks_requires_focus(monkeypatch):
+    class FakeDB:
+        def __init__(self, config):
+            self.solr_base_url = 'http://solr:8983'
+            self.solr_notebook = 'notebooks'
+            self.solr_basic_auth_username = None
+            self.solr_basic_auth_password = None
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+
+    with pytest.raises(tornado.web.HTTPError) as error:
+        handler = _make_nbsearch_handler(
+            {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+        )
+        await handler._search_notebooks(
+            'notebooks',
+            {'query': 'pandas'},
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.reason == 'focus is required'
+
+
+@pytest.mark.asyncio
+async def test_search_nbsearch_notebooks_requires_normalized_date_range(monkeypatch):
+    class FakeDB:
+        def __init__(self, config):
+            self.solr_base_url = 'http://solr:8983'
+            self.solr_notebook = 'notebooks'
+            self.solr_basic_auth_username = None
+            self.solr_basic_auth_password = None
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+
+    with pytest.raises(tornado.web.HTTPError) as error:
+        handler = _make_nbsearch_handler(
+            {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+        )
+        await handler._search_notebooks(
+            'notebooks',
+            {'query': 'pandas', 'focus': 'pandas usage', 'dateFrom': '2026-01-01'},
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.reason == 'dateFrom must be normalized to dateTimeFrom by the client'
+
+
+@pytest.mark.asyncio
+async def test_search_nbsearch_notebooks_rejects_unsupported_sort(monkeypatch):
+    class FakeDB:
+        def __init__(self, config):
+            self.solr_base_url = 'http://solr:8983'
+            self.solr_notebook = 'notebooks'
+            self.solr_basic_auth_username = None
+            self.solr_basic_auth_password = None
+
+    monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
+
+    with pytest.raises(tornado.web.HTTPError) as error:
+        handler = _make_nbsearch_handler(
+            {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+        )
+        await handler._search_notebooks(
+            'notebooks',
+            {
+                'query': 'pandas',
+                'focus': 'pandas usage',
+                'sort': 'score desc',
+            },
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.reason == 'unsupported sort: score desc'
+
+
+@pytest.mark.asyncio
+async def test_get_search_reference_cells_returns_empty_for_invalid_payload(monkeypatch, caplog):
+    class FakeDB:
+        async def download_file(self, notebook_id, data):
+            data.write(b'not valid json')
+
+    handler = _make_nbsearch_handler(
+        {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
+    )
+
+    with caplog.at_level(logging.ERROR):
+        result = await handler._get_search_reference_cells(
+            FakeDB(),
+            {
+                'notebookId': 'broken-notebook',
+                'filename': 'broken.ipynb',
+                'query': {'start': 0},
+                'count': 3,
+            },
+            False,
+        )
+
+    assert result == {
+        'cells': [],
+        'error': 'notebook payload is not valid JSON',
+    }
+    assert any(
+        'Invalid nbsearch notebook payload: notebook_id=broken-notebook filename=broken.ipynb' in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_nbsearch_handler_returns_json_for_unhandled_errors():
+    handler = MagicMock()
+    handler.current_user = 'user'
+    handler.get_json_body.return_value = {'query': 'pandas', 'focus': 'usage'}
+    handler._search_notebooks = AsyncMock(side_effect=RuntimeError('provider unavailable'))
+
+    await NBSearchHandler.post(handler, 'notebooks')
+
+    handler.log.exception.assert_called_once_with(
+        'Unhandled nbsearch request failure: target=%s',
+        'notebooks',
+    )
+    handler.set_status.assert_called_once_with(500)
+    assert json.loads(handler.finish.call_args[0][0]) == {
+        'error': 'nbsearch request failed; see server logs',
+    }
 
 
 # --- _fetch_openai_models ---

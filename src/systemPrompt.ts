@@ -3,6 +3,7 @@ const QUERY_SYNTAX = `Query syntax:
   { "contains": "text" } - substring match
   { "start": N } - cell index
   { "id": "cellId" } - cell ID
+  { "meme": "UUID" } - nblineage cell meme ID
   { "active": true } - currently focused cell (active notebook only)
   { "selected": true } - selected cells (active notebook only)`;
 
@@ -11,6 +12,10 @@ interface IActionDetail {
   required: string[];
   optional: string[];
   usesQuery: boolean;
+}
+
+interface ISystemPromptOptions {
+  nbsearchAvailable?: boolean;
 }
 
 const ACTION_DETAILS: Record<string, IActionDetail> = {
@@ -67,6 +72,27 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     required: ['path', 'query'],
     optional: [],
     usesQuery: true
+  },
+  searchNotebooks: {
+    description:
+      'Search indexed notebooks and return focus-oriented summaries with search references',
+    required: ['query', 'focus'],
+    optional: ['dateFrom', 'dateTo', 'start', 'limit', 'sort'],
+    usesQuery: false
+  },
+  getCellsFromSearch: {
+    description:
+      'Read cells from a search reference using the approved Privacy filter setting',
+    required: ['referenceId'],
+    optional: ['start', 'limit'],
+    usesQuery: false
+  },
+  summaryCellsFromSearch: {
+    description:
+      'Summarize cells from a search reference and identify cell ranges to read',
+    required: ['referenceId', 'focus'],
+    optional: [],
+    usesQuery: false
   },
   insertCell: {
     description: 'Insert new cell',
@@ -127,7 +153,25 @@ export function getActionHelp(actionName: string): string {
   return lines.join('\n');
 }
 
-export function buildSystemPrompt(): string {
+const NBSEARCH_ACTIONS = `
+Search (indexed notebooks):
+  - searchNotebooks: { "query": "...", "focus": "...", "dateFrom": "YYYY-MM-DD", "dateTo": "YYYY-MM-DD", "start": N, "limit": N, "sort": "mtime desc" } - Find notebooks with a Solr/Lucene query string and return summaries focused on the user's purpose. "focus" is required and must describe the user's purpose for judging relevance. Default limit is 10.
+  The searchNotebooks query is sent to the jupyter-notebook Solr core as q. Use fielded Solr queries when the user specifies fields: filename:*BinderHub* for file name contains, owner:alice for owner, source__markdown__heading_1:検索 for top-level title/heading, and plain terms such as BinderHub for normal content/topic search.
+  searchNotebooks downloads each matched notebook payload from nbsearch storage, reads cells through nblibram using the user-approved Privacy filter setting, and sends those cells to the configured LLM provider to create the summary. Privacy filter is enabled by default; if the user turns it off while approving the action, unfiltered cells are shared.
+  Supported sort values: "mtime desc", "mtime asc", "ctime desc", "ctime asc", "atime desc", "atime asc", "lc_cell_meme__execution_end_time desc", "lc_cell_meme__execution_end_time asc". Prefer "mtime desc" when the user asks for recent updates, and "lc_cell_meme__execution_end_time desc" when the user asks for recently executed notebooks.
+  Treat dateFrom/dateTo as the user's local calendar dates. The client converts them to UTC datetime bounds before querying.
+  - summaryCellsFromSearch: { "referenceId": "...", "focus": "..." } - Summarize cells from a search result reference and identify relevant cell indexes/ranges. Use this before getCellsFromSearch when the notebook may be large or when you need to locate the relevant part.
+  - getCellsFromSearch: { "referenceId": "...", "start": N, "limit": N } - Read raw cells from a search result reference using the approved Privacy filter setting. start/limit are optional offsets within that reference's cells.
+  Prefer searchNotebooks over listNotebookFiles when the user asks to search, find, discover, or look across indexed notebooks.
+  listNotebookFiles only lists paths in a directory; it does not search notebook content or the nbsearch index.
+  searchNotebooks returns filename, owner, server, mtime, ctime, atime, summaries, and references; it does not return raw cells. Its references point to summaryCellsFromSearch.
+  summaryCellsFromSearch returns cellCount, coverage, a summary that includes cell indexes/ranges, and readAction.type="getCellsFromSearch" with the same referenceId. Use the summary cell numbers to choose start/limit for getCellsFromSearch.
+  Never call summaryCellsFromSearch or getCellsFromSearch until a prior searchNotebooks result has returned a concrete referenceId. Do not invent placeholder reference IDs.
+  Do not read many raw cells with getCellsFromSearch just to locate content. Use summaryCellsFromSearch first, then read only the relevant raw range.
+  If searchNotebooks returns numFound greater than start + returned, tell the user that more results are available. Use start with the same query and focus when more results are needed.
+`;
+
+export function buildSystemPrompt(options: ISystemPromptOptions = {}): string {
   return `You are Mynerva, a Jupyter notebook assistant.
 - Always respond with JSON only. No text before or after.
 - JSON structure:
@@ -153,6 +197,7 @@ Query (other files) - results include "path":
   - getCellsFromFile: { "path": "file.ipynb", "query": {...}, "count": N } - Get cell range
   - getOutputFromFile: { "path": "file.ipynb", "query": {...} } - Get output of matched cell
 
+${options.nbsearchAvailable ? NBSEARCH_ACTIONS : ''}
 Mutate (active notebook):
   - insertCell: { "position": {...} or "end", "cellType": "code"|"markdown", "source": "..." } - Insert new cell
   - updateCell: { "query": {...}, "source": "...", "_hash": "..." } - Update cell content (requires _hash from prior read)
@@ -164,6 +209,7 @@ Query syntax:
   { "contains": "text" } - substring match
   { "start": N } - cell index
   { "id": "cellId" } - cell ID
+  { "meme": "UUID" } - nblineage cell meme ID
   { "active": true } - currently focused cell (active notebook only)
   { "selected": true } - selected cells (active notebook only)
 

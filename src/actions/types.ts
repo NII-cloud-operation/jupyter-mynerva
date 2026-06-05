@@ -21,6 +21,9 @@ export type IQueryAction =
   | IGetSectionFromFileAction
   | IGetCellsFromFileAction
   | IGetOutputFromFileAction
+  | ISearchNotebooksAction
+  | ISummaryCellsFromSearchAction
+  | IGetCellsFromSearchAction
   | IListHelpAction
   | IHelpDetailAction;
 
@@ -85,6 +88,32 @@ export interface IGetOutputFromFileAction {
   type: 'getOutputFromFile';
   path: string;
   query: ICellQuery;
+}
+
+export interface ISearchNotebooksAction {
+  type: 'searchNotebooks';
+  query: string;
+  focus: string;
+  dateFrom?: string;
+  dateTo?: string;
+  dateTimeFrom?: string;
+  dateTimeTo?: string;
+  start?: number;
+  limit?: number;
+  sort?: string;
+}
+
+export interface IGetCellsFromSearchAction {
+  type: 'getCellsFromSearch';
+  referenceId: string;
+  start?: number;
+  limit?: number;
+}
+
+export interface ISummaryCellsFromSearchAction {
+  type: 'summaryCellsFromSearch';
+  referenceId: string;
+  focus: string;
 }
 
 export interface IListHelpAction {
