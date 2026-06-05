@@ -31,6 +31,7 @@ from jupyter_mynerva.routes import (
     _build_openai_tools,
     _build_openai_input,
     _build_anthropic_params,
+    _anthropic_thinking_config,
     _build_bedrock_converse_body,
     _send_sse,
     sse_serializer,
@@ -1186,7 +1187,31 @@ def test_build_anthropic_params_no_system():
     params = _build_anthropic_params(messages)
     assert 'system' not in params
     assert params['max_tokens'] == 32000
+    # No model given -> conservative budget_tokens form.
     assert params['thinking'] == {'type': 'enabled', 'budget_tokens': 2000}
+
+
+@pytest.mark.parametrize('model', [
+    'claude-opus-4-6', 'claude-opus-4-7', 'claude-opus-4-8',
+    'claude-sonnet-4-6', 'us.anthropic.claude-opus-4-8-v1:0',
+])
+def test_anthropic_thinking_adaptive_for_4_6_plus(model):
+    assert _anthropic_thinking_config(model) == {'type': 'adaptive'}
+
+
+@pytest.mark.parametrize('model', [
+    'claude-opus-4-5', 'claude-sonnet-4-5', 'claude-haiku-4-5',
+    'claude-3-7-sonnet', 'anthropic.claude-3-5-sonnet-20240620-v1:0', '',
+])
+def test_anthropic_thinking_budget_tokens_for_older(model):
+    assert _anthropic_thinking_config(model) == {
+        'type': 'enabled', 'budget_tokens': 2000}
+
+
+def test_build_anthropic_params_uses_adaptive_for_new_model():
+    params = _build_anthropic_params([{'role': 'user', 'content': 'Hi'}],
+                                     model='claude-opus-4-8')
+    assert params['thinking'] == {'type': 'adaptive'}
 
 
 def test_build_anthropic_params_tools_blocks_and_results():

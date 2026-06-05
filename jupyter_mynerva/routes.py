@@ -745,7 +745,20 @@ async def chat_openai(handler, api_key, model, messages, tools=None, base_url=No
             _send_sse(handler, {'type': 'error', 'error': error_msg})
 
 
-def _build_anthropic_params(messages, tools=None):
+def _anthropic_thinking_config(model):
+    """Choose the thinking config by model version.
+
+    Adaptive thinking is supported from Claude 4.6 onward, where the older
+    `budget_tokens` form is removed (it 400s on Opus 4.7/4.8). Earlier models
+    use `budget_tokens`.
+    """
+    m = re.search(r'(\d+)-(\d+)', model)
+    if m and (int(m.group(1)), int(m.group(2))) >= (4, 6):
+        return {'type': 'adaptive'}
+    return {'type': 'enabled', 'budget_tokens': 2000}
+
+
+def _build_anthropic_params(messages, tools=None, model=''):
     """Build Anthropic API parameters from message list.
 
     System messages fold into the `system` param. Assistant turns carry their
@@ -786,7 +799,7 @@ def _build_anthropic_params(messages, tools=None):
     kwargs = {
         'max_tokens': 32000,
         'messages': api_messages,
-        'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+        'thinking': _anthropic_thinking_config(model)
     }
     if tools:
         kwargs['tools'] = [
@@ -803,7 +816,7 @@ def _build_anthropic_params(messages, tools=None):
 async def chat_anthropic(handler, api_key, model, messages, tools=None):
     """Serializer for Anthropic messages.stream API."""
     client = AsyncAnthropic(api_key=api_key)
-    kwargs = _build_anthropic_params(messages, tools)
+    kwargs = _build_anthropic_params(messages, tools, model)
 
     async with client.messages.stream(model=model, **kwargs) as stream:
         # content_block.type matches Mynerva's content_type for thinking/text
