@@ -28,10 +28,10 @@ from jupyter_mynerva.routes import (
     BedrockModelsHandler,
     ProviderModelsHandler,
     _NotebookStore,
-    _convert_messages_for_responses_api,
+    _build_openai_tools,
+    _build_openai_input,
     _build_anthropic_params,
     _build_bedrock_converse_body,
-    _extract_json_content,
     _send_sse,
     sse_serializer,
     chat_openai,
@@ -799,66 +799,77 @@ async def test_resolve_chat_config_no_defaults_raises(monkeypatch):
         await resolve_chat_config({'useDefault': True})
 
 
-# --- _convert_messages_for_responses_api ---
+# --- _build_openai_tools ---
 
-def test_convert_messages_system_to_developer():
+def test_build_openai_tools_wraps_function_shape():
+    tools = [
+        {'name': 'getToc', 'description': 'Get the table of contents',
+         'parameters': {'type': 'object', 'properties': {}}},
+    ]
+    result = _build_openai_tools(tools)
+    assert result == [
+        {'type': 'function', 'name': 'getToc',
+         'description': 'Get the table of contents',
+         'parameters': {'type': 'object', 'properties': {}}},
+    ]
+
+
+# --- _build_openai_input ---
+
+def test_build_openai_input_system_to_developer():
     messages = [
         {'role': 'system', 'content': 'You are an assistant.'},
         {'role': 'user', 'content': 'Hello'},
     ]
-    result = _convert_messages_for_responses_api(messages)
-    assert result[0]['role'] == 'developer'
-    assert result[0]['content'] == 'You are an assistant.'
-    assert result[1]['role'] == 'user'
-    assert result[1]['content'] == 'Hello'
+    result = _build_openai_input(messages)
+    assert result[0] == {'role': 'developer', 'content': 'You are an assistant.'}
+    assert result[1] == {'role': 'user', 'content': 'Hello'}
 
 
-def test_convert_messages_preserves_other_roles():
+def test_build_openai_input_plain_assistant_and_user():
     messages = [
         {'role': 'user', 'content': 'Hi'},
         {'role': 'assistant', 'content': 'Hello'},
     ]
-    result = _convert_messages_for_responses_api(messages)
-    assert result[0]['role'] == 'user'
-    assert result[1]['role'] == 'assistant'
+    result = _build_openai_input(messages)
+    assert result[0] == {'role': 'user', 'content': 'Hi'}
+    assert result[1] == {'role': 'assistant', 'content': 'Hello'}
 
 
-def test_convert_messages_missing_role_defaults_to_user():
-    messages = [{'content': 'No role specified'}]
-    result = _convert_messages_for_responses_api(messages)
-    assert result[0]['role'] == 'user'
+def test_build_openai_input_missing_role_defaults_to_user():
+    result = _build_openai_input([{'content': 'No role specified'}])
+    assert result[0] == {'role': 'user', 'content': 'No role specified'}
 
 
-def test_convert_messages_missing_content_defaults_to_empty():
-    messages = [{'role': 'user'}]
-    result = _convert_messages_for_responses_api(messages)
-    assert result[0]['content'] == ''
+def test_build_openai_input_missing_content_defaults_to_empty():
+    result = _build_openai_input([{'role': 'user'}])
+    assert result[0] == {'role': 'user', 'content': ''}
 
 
-# --- _extract_json_content ---
-
-def test_extract_json_content_basic():
-    raw = '{"messages":[{"role":"assistant","content":"Hello world"}],"actions":[]}'
-    assert _extract_json_content(raw) == 'Hello world'
-
-
-def test_extract_json_content_partial():
-    raw = '{"messages":[{"role":"assistant","content":"Hello'
-    assert _extract_json_content(raw) == 'Hello'
-
-
-def test_extract_json_content_escaped():
-    raw = '{"messages":[{"role":"assistant","content":"line1\\nline2"}]}'
-    assert _extract_json_content(raw) == 'line1\nline2'
+def test_build_openai_input_assistant_blocks_spliced_verbatim():
+    blocks = [
+        {'type': 'reasoning', 'summary': []},
+        {'type': 'function_call', 'call_id': 'call_1', 'name': 'getToc',
+         'arguments': '{}'},
+    ]
+    messages = [{'role': 'assistant', 'assistantBlocks': blocks}]
+    result = _build_openai_input(messages)
+    assert result == blocks
 
 
-def test_extract_json_content_no_content_yet():
-    raw = '{"messages":[{"role":'
-    assert _extract_json_content(raw) == ''
-
-
-def test_extract_json_content_empty():
-    assert _extract_json_content('') == ''
+def test_build_openai_input_tool_results_to_function_call_output():
+    messages = [
+        {'role': 'user', 'toolResults': [
+            {'id': 'call_1', 'result': '{"toc": []}'},
+            {'id': 'call_2', 'result': 'oops'},
+        ]},
+    ]
+    result = _build_openai_input(messages)
+    assert result == [
+        {'type': 'function_call_output', 'call_id': 'call_1',
+         'output': '{"toc": []}'},
+        {'type': 'function_call_output', 'call_id': 'call_2', 'output': 'oops'},
+    ]
 
 
 # --- _send_sse ---
@@ -899,10 +910,12 @@ def _async_iter(items):
 class _AsyncStreamCtx:
     """Async context manager that yields events from a list and exposes
     Anthropic's async final-state methods (get_final_message/text)."""
-    def __init__(self, events, final_text='', stop_reason='end_turn'):
+    def __init__(self, events, final_text='', stop_reason='end_turn',
+                 final_content=None):
         self._events = list(events)
         self._final_text = final_text
         self._stop_reason = stop_reason
+        self._final_content = final_content
 
     async def __aenter__(self):
         return self
@@ -919,6 +932,10 @@ class _AsyncStreamCtx:
     async def get_final_message(self):
         msg = MagicMock()
         msg.stop_reason = self._stop_reason
+        if self._final_content is not None:
+            msg.content = self._final_content
+        else:
+            msg.content = [_make_anthropic_block('text', text=self._final_text)]
         return msg
 
 
@@ -933,20 +950,49 @@ def _make_event(event_type, **kwargs):
     return event
 
 
+def _make_output_message(dump=None):
+    """A non-function_call Responses output item (e.g. an assistant message)."""
+    o = MagicMock()
+    o.type = 'message'
+    o.model_dump.return_value = dump or {'type': 'message', 'role': 'assistant'}
+    return o
+
+
+def _make_output_function_call(call_id, name, arguments, dump=None):
+    """A function_call Responses output item."""
+    o = MagicMock()
+    o.type = 'function_call'
+    o.call_id = call_id
+    o.name = name
+    o.arguments = arguments
+    o.model_dump.return_value = dump or {
+        'type': 'function_call', 'call_id': call_id, 'name': name,
+        'arguments': arguments,
+    }
+    return o
+
+
+def _make_completed_response(output=None, status='completed', incomplete_details=None):
+    resp = MagicMock()
+    resp.output = output if output is not None else [_make_output_message()]
+    resp.status = status
+    resp.incomplete_details = incomplete_details
+    return resp
+
+
 @pytest.mark.asyncio
 async def test_chat_openai_basic_flow():
     handler = MagicMock()
-    # Simulate realistic JSON token stream from OpenAI
-    json_text = '{"messages":[{"role":"assistant","content":"Hi there!"}],"actions":[]}'
+    # Streaming now emits RAW assistant text (no JSON-envelope extraction).
     events = [
         _make_event('response.created'),
         _make_event('response.in_progress'),
         _make_event('response.output_item.added'),
         _make_event('response.content_part.added'),
-        _make_event('response.output_text.delta', delta='{"messages":[{"role":"assistant","content":"Hi'),
-        _make_event('response.output_text.delta', delta=' there!"}],"actions":[]}'),
-        _make_event('response.output_text.done', text=json_text),
-        _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
+        _make_event('response.output_text.delta', delta='Hi'),
+        _make_event('response.output_text.delta', delta=' there!'),
+        _make_event('response.output_text.done', text='Hi there!'),
+        _make_event('response.completed', response=_make_completed_response()),
     ]
 
     with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
@@ -965,14 +1011,16 @@ async def test_chat_openai_basic_flow():
     assert starts[0]['content_type'] == 'thinking'
     assert starts[1]['content_type'] == 'text'
 
-    # _extract_json_content extracts accumulated content from JSON
+    # Raw text deltas are emitted verbatim (incremental, no extraction).
     deltas = [p for p in payloads if p['type'] == 'content_block_delta']
     assert deltas[0]['content_type'] == 'text'
-    assert deltas[0]['delta'] == 'Hi'  # First chunk: partial content
-    assert deltas[1]['delta'] == 'Hi there!'  # Second chunk: full content so far
+    assert deltas[0]['delta'] == 'Hi'
+    assert deltas[1]['delta'] == ' there!'
 
     done = [p for p in payloads if p['type'] == 'message_done']
-    assert done[0]['text'] == json_text  # Full JSON for processLLMResponse
+    assert done[0]['text'] == 'Hi there!'  # accumulated raw text
+    assert done[0]['tool_calls'] == []
+    assert done[0]['assistant_blocks'] == [{'type': 'message', 'role': 'assistant'}]
 
     stops = [p for p in payloads if p['type'] == 'content_block_stop']
     assert any(s['content_type'] == 'thinking' for s in stops)
@@ -980,6 +1028,32 @@ async def test_chat_openai_basic_flow():
 
     assert written[-1] == 'data: [DONE]\n\n'
     handler.finish.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_openai_tool_call():
+    handler = MagicMock()
+    fc = _make_output_function_call('call_1', 'getToc', '{"depth": 2}')
+    events = [
+        _make_event('response.in_progress'),
+        _make_event('response.completed',
+                    response=_make_completed_response(output=[fc], status='completed')),
+    ]
+
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.responses.create = AsyncMock(return_value=_async_iter(events))
+        await chat_openai(handler, 'key', 'gpt-4o', [], tools=[
+            {'name': 'getToc', 'description': 'd',
+             'parameters': {'type': 'object'}}])
+
+    payloads, _ = _parse_sse_payloads(handler)
+    done = [p for p in payloads if p['type'] == 'message_done'][0]
+    assert done['stop_reason'] == 'tool_use'
+    assert done['tool_calls'] == [
+        {'id': 'call_1', 'name': 'getToc', 'input': {'depth': 2}}]
+    assert done['assistant_blocks'] == [{
+        'type': 'function_call', 'call_id': 'call_1', 'name': 'getToc',
+        'arguments': '{"depth": 2}'}]
 
 
 @pytest.mark.asyncio
@@ -992,7 +1066,7 @@ async def test_chat_openai_reasoning():
         _make_event('response.content_part.added'),
         _make_event('response.output_text.delta', delta='Answer'),
         _make_event('response.output_text.done', text='Answer'),
-        _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
+        _make_event('response.completed', response=_make_completed_response()),
     ]
 
     with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
@@ -1052,7 +1126,7 @@ async def test_chat_openai_system_role_converted():
     ]
     events = [
         _make_event('response.output_text.done', text='Hello'),
-        _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
+        _make_event('response.completed', response=_make_completed_response()),
     ]
 
     with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
@@ -1070,7 +1144,7 @@ async def test_chat_openai_with_base_url():
     handler = MagicMock()
     events = [
         _make_event('response.output_text.done', text='ok'),
-        _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
+        _make_event('response.completed', response=_make_completed_response()),
     ]
 
     with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
@@ -1087,13 +1161,24 @@ def test_build_anthropic_params_system_extraction():
     messages = [
         {'role': 'system', 'content': 'Be helpful'},
         {'role': 'user', 'content': 'Hi'},
-        {'role': 'assistant', 'content': 'Hello', 'actions': [{'type': 'getToc'}]},
+        {'role': 'assistant', 'content': 'Hello'},
     ]
     params = _build_anthropic_params(messages)
     assert params['system'] == 'Be helpful'
     assert len(params['messages']) == 2
     assert params['messages'][0] == {'role': 'user', 'content': 'Hi'}
-    assert '[Actions proposed]' in params['messages'][1]['content']
+    # Plain assistant content passes through verbatim (no action annotations).
+    assert params['messages'][1] == {'role': 'assistant', 'content': 'Hello'}
+
+
+def test_build_anthropic_params_multiple_system_messages_folded():
+    messages = [
+        {'role': 'system', 'content': 'Be helpful'},
+        {'role': 'system', 'content': 'Be concise'},
+        {'role': 'user', 'content': 'Hi'},
+    ]
+    params = _build_anthropic_params(messages)
+    assert params['system'] == 'Be helpful\n\nBe concise'
 
 
 def test_build_anthropic_params_no_system():
@@ -1102,6 +1187,32 @@ def test_build_anthropic_params_no_system():
     assert 'system' not in params
     assert params['max_tokens'] == 32000
     assert params['thinking'] == {'type': 'enabled', 'budget_tokens': 2000}
+
+
+def test_build_anthropic_params_tools_blocks_and_results():
+    blocks = [
+        {'type': 'text', 'text': 'Let me check'},
+        {'type': 'tool_use', 'id': 'tu_1', 'name': 'getToc', 'input': {}},
+    ]
+    messages = [
+        {'role': 'assistant', 'assistantBlocks': blocks},
+        {'role': 'user', 'toolResults': [
+            {'id': 'tu_1', 'result': '{"toc": []}'},
+            {'id': 'tu_2', 'result': 'boom', 'isError': True},
+        ]},
+    ]
+    params = _build_anthropic_params(messages, tools=[
+        {'name': 'getToc', 'description': 'd', 'parameters': {'type': 'object'}}])
+
+    assert params['tools'] == [
+        {'name': 'getToc', 'description': 'd',
+         'input_schema': {'type': 'object'}}]
+    assert params['messages'][0] == {'role': 'assistant', 'content': blocks}
+    assert params['messages'][1] == {'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': 'tu_1', 'content': '{"toc": []}'},
+        {'type': 'tool_result', 'tool_use_id': 'tu_2', 'content': 'boom',
+         'is_error': True},
+    ]}
 
 
 # --- chat_anthropic ---
@@ -1130,27 +1241,40 @@ def _make_delta(delta_type, **kwargs):
     return delta
 
 
+def _make_anthropic_block(block_type, *, dump=None, **kwargs):
+    """A final-message content block (exposes .type, .model_dump, and attrs).
+
+    For tool_use blocks pass id/name/input; for text pass text.
+    """
+    block = MagicMock()
+    block.type = block_type
+    for k, v in kwargs.items():
+        setattr(block, k, v)
+    if dump is None:
+        dump = {'type': block_type, **kwargs}
+    block.model_dump.return_value = dump
+    return block
+
+
 @pytest.mark.asyncio
 async def test_chat_anthropic_basic_flow():
     handler = MagicMock()
-    # chat_anthropic extracts the content field from a Mynerva JSON envelope,
-    # so the mocked text deltas form a partial JSON that resolves to "Hello world".
-    json_text = '{"messages":[{"role":"assistant","content":"Hello world"}],"actions":[]}'
+    # Streaming now emits RAW text deltas (no JSON-envelope extraction).
     events = [
         _make_anthropic_event('content_block_start',
                               content_block=_make_content_block('text')),
         _make_anthropic_event('content_block_delta',
-                              delta=_make_delta('text_delta',
-                                                text='{"messages":[{"role":"assistant","content":"Hello')),
+                              delta=_make_delta('text_delta', text='Hello')),
         _make_anthropic_event('content_block_delta',
-                              delta=_make_delta('text_delta',
-                                                text=' world"}],"actions":[]}')),
+                              delta=_make_delta('text_delta', text=' world')),
         _make_anthropic_event('content_block_stop'),
         _make_anthropic_event('message_stop'),
     ]
 
-    mock_stream = _AsyncStreamCtx(events, final_text=json_text,
-                                  stop_reason='end_turn')
+    final_content = [_make_anthropic_block('text', text='Hello world')]
+    mock_stream = _AsyncStreamCtx(events, final_text='Hello world',
+                                  stop_reason='end_turn',
+                                  final_content=final_content)
     with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
         MockAnthropic.return_value.messages.stream = MagicMock(return_value=mock_stream)
         await chat_anthropic(handler, 'key', 'claude-sonnet', [])
@@ -1163,18 +1287,57 @@ async def test_chat_anthropic_basic_flow():
     assert 'content_block_stop' in types
     assert 'message_done' in types
 
-    # _extract_json_content emits accumulated content (cumulative, not incremental)
+    # Raw text deltas emitted verbatim (incremental).
     text_deltas = [p for p in payloads
                    if p['type'] == 'content_block_delta' and p['content_type'] == 'text']
     assert text_deltas[0]['delta'] == 'Hello'
-    assert text_deltas[1]['delta'] == 'Hello world'
+    assert text_deltas[1]['delta'] == ' world'
 
     done = [p for p in payloads if p['type'] == 'message_done']
-    assert done[0]['text'] == json_text
+    assert done[0]['text'] == 'Hello world'
     assert done[0]['stop_reason'] == 'end_turn'
+    assert done[0]['tool_calls'] == []
+    assert done[0]['assistant_blocks'] == [{'type': 'text', 'text': 'Hello world'}]
 
     assert written[-1] == 'data: [DONE]\n\n'
     handler.finish.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_anthropic_tool_use():
+    handler = MagicMock()
+    events = [
+        _make_anthropic_event('content_block_start',
+                              content_block=_make_content_block('text')),
+        _make_anthropic_event('content_block_delta',
+                              delta=_make_delta('text_delta', text='Checking')),
+        _make_anthropic_event('content_block_stop'),
+    ]
+    final_content = [
+        _make_anthropic_block('text', text='Checking'),
+        _make_anthropic_block(
+            'tool_use', id='tu_1', name='getToc', input={'depth': 2},
+            dump={'type': 'tool_use', 'id': 'tu_1', 'name': 'getToc',
+                  'input': {'depth': 2}}),
+    ]
+    mock_stream = _AsyncStreamCtx(events, final_text='Checking',
+                                  stop_reason='tool_use',
+                                  final_content=final_content)
+    with patch('jupyter_mynerva.routes.AsyncAnthropic') as MockAnthropic:
+        MockAnthropic.return_value.messages.stream = MagicMock(return_value=mock_stream)
+        await chat_anthropic(handler, 'key', 'claude-sonnet', [], tools=[
+            {'name': 'getToc', 'description': 'd',
+             'parameters': {'type': 'object'}}])
+
+    payloads, _ = _parse_sse_payloads(handler)
+    done = [p for p in payloads if p['type'] == 'message_done'][0]
+    assert done['stop_reason'] == 'tool_use'
+    assert done['tool_calls'] == [
+        {'id': 'tu_1', 'name': 'getToc', 'input': {'depth': 2}}]
+    assert done['assistant_blocks'] == [
+        {'type': 'text', 'text': 'Checking'},
+        {'type': 'tool_use', 'id': 'tu_1', 'name': 'getToc',
+         'input': {'depth': 2}}]
 
 
 @pytest.mark.asyncio
@@ -1235,14 +1398,12 @@ async def test_chat_anthropic_api_error():
 @pytest.mark.asyncio
 async def test_chat_openai_stop_reason():
     handler = MagicMock()
-    completed_response = MagicMock()
-    completed_response.status = 'completed'
-    completed_response.incomplete_details = None
+    completed_response = _make_completed_response(status='completed')
     events = [
         _make_event('response.in_progress'),
         _make_event('response.content_part.added'),
-        _make_event('response.output_text.delta', delta='{"messages":[{"role":"assistant","content":"ok"}],"actions":[]}'),
-        _make_event('response.output_text.done', text='{"messages":[{"role":"assistant","content":"ok"}],"actions":[]}'),
+        _make_event('response.output_text.delta', delta='ok'),
+        _make_event('response.output_text.done', text='ok'),
         _make_event('response.completed', response=completed_response),
     ]
 
@@ -1261,9 +1422,8 @@ async def test_chat_openai_stop_reason_incomplete():
     handler = MagicMock()
     incomplete = MagicMock()
     incomplete.reason = 'max_tokens'
-    completed_response = MagicMock()
-    completed_response.status = 'incomplete'
-    completed_response.incomplete_details = incomplete
+    completed_response = _make_completed_response(
+        status='incomplete', incomplete_details=incomplete)
     events = [
         _make_event('response.in_progress'),
         _make_event('response.content_part.added'),
@@ -1289,7 +1449,7 @@ async def test_chat_openai_reasoning_done():
         _make_event('response.reasoning_summary_text.done', text='Step 1. Step 2.'),
         _make_event('response.content_part.added'),
         _make_event('response.output_text.done', text='answer'),
-        _make_event('response.completed', response=MagicMock(status='completed', incomplete_details=None)),
+        _make_event('response.completed', response=_make_completed_response()),
     ]
 
     with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
@@ -1338,19 +1498,20 @@ async def test_chat_echo_trigger_action():
 
     payloads, written = _parse_sse_payloads(handler)
 
-    # Lifecycle: thinking -> text -> message_done
+    # Lifecycle: text -> message_done
     starts = [p['content_type'] for p in payloads if p['type'] == 'content_block_start']
-    assert starts == ['thinking', 'text']
+    assert starts == ['text']
 
     stops = [p['content_type'] for p in payloads if p['type'] == 'content_block_stop']
-    assert 'thinking' in stops
     assert 'text' in stops
 
     done = [p for p in payloads if p['type'] == 'message_done']
     assert len(done) == 1
-    body = json.loads(done[0]['text'])
-    assert body['actions'][0]['type'] == 'getToc'
-    assert body['messages'][0]['role'] == 'assistant'
+    # Native tool calls on message_done; assistant_blocks is None for echo.
+    assert done[0]['stop_reason'] == 'tool_use'
+    assert done[0]['tool_calls'][0]['name'] == 'getToc'
+    assert done[0]['assistant_blocks'] is None
+    assert done[0]['text'] == 'Echo: requesting getToc'
 
     assert written[-1] == 'data: [DONE]\n\n'
     handler.finish.assert_called_once()
@@ -1359,16 +1520,18 @@ async def test_chat_echo_trigger_action():
 @pytest.mark.asyncio
 async def test_chat_echo_action_results_passthrough():
     handler = MagicMock()
-    messages = [{'role': 'user', 'content': '[Action Results]\n{"toc": [...]}'}]
+    # A turn carrying toolResults -> echo finishes with text and no more calls.
+    messages = [{'role': 'user', 'toolResults': [
+        {'id': 'echo_getToc', 'result': '{"toc": [...]}'}]}]
 
     await chat_echo(handler, messages)
 
     payloads, _ = _parse_sse_payloads(handler)
 
     done = [p for p in payloads if p['type'] == 'message_done']
-    body = json.loads(done[0]['text'])
-    assert body['actions'] == []
-    assert '[Action Results]' in body['messages'][0]['content']
+    assert done[0]['tool_calls'] == []
+    assert done[0]['stop_reason'] == 'end_turn'
+    assert '{"toc": [...]}' in done[0]['text']
 
 
 @pytest.mark.asyncio
@@ -1380,9 +1543,8 @@ async def test_chat_echo_default_action_when_no_trigger():
 
     payloads, _ = _parse_sse_payloads(handler)
     done = [p for p in payloads if p['type'] == 'message_done']
-    body = json.loads(done[0]['text'])
     # Default trigger is 'toc'
-    assert body['actions'][0]['type'] == 'getToc'
+    assert done[0]['tool_calls'][0]['name'] == 'getToc'
 
 
 # --- sse_serializer decorator ---
@@ -1528,8 +1690,7 @@ def test_build_bedrock_converse_body_basic():
         [
             {'role': 'system', 'content': 'You are helpful.'},
             {'role': 'system', 'content': 'Be concise.'},
-            {'role': 'user', 'content': 'Hello',
-             'actions': [{'type': 'getToc'}]},
+            {'role': 'user', 'content': 'Hello'},
             {'role': 'assistant', 'content': 'Hi!'},
         ],
         model='us.anthropic.claude-haiku-4-5-20251001-v1:0',
@@ -1539,11 +1700,8 @@ def test_build_bedrock_converse_body_basic():
         {'text': 'Be concise.'},
     ]
     assert body['inferenceConfig'] == {'maxTokens': 32000}
-    assert body['messages'][0]['role'] == 'user'
-    user_text = body['messages'][0]['content'][0]['text']
-    assert user_text.startswith('Hello')
-    assert '[Actions proposed]' in user_text
-    assert '"getToc"' in user_text
+    # User content is a plain text block (no action annotations).
+    assert body['messages'][0] == {'role': 'user', 'content': [{'text': 'Hello'}]}
     assert body['messages'][1] == {'role': 'assistant', 'content': [{'text': 'Hi!'}]}
     # Claude in model id -> thinking enabled
     assert body['additionalModelRequestFields'] == {
@@ -1559,20 +1717,49 @@ def test_build_bedrock_converse_body_no_thinking_for_non_claude():
     assert 'additionalModelRequestFields' not in body
 
 
+def test_build_bedrock_converse_body_tools_blocks_and_results():
+    blocks = [
+        {'text': 'Let me check'},
+        {'toolUse': {'toolUseId': 'tu_1', 'name': 'getToc', 'input': {}}},
+    ]
+    body = _build_bedrock_converse_body(
+        [
+            {'role': 'assistant', 'assistantBlocks': blocks},
+            {'role': 'user', 'toolResults': [
+                {'id': 'tu_1', 'result': '{"toc": []}'},
+                {'id': 'tu_2', 'result': 'boom', 'isError': True},
+            ]},
+        ],
+        model='us.anthropic.claude-haiku-4-5-20251001-v1:0',
+        tools=[{'name': 'getToc', 'description': 'd',
+                'parameters': {'type': 'object'}}],
+    )
+    assert body['toolConfig'] == {'tools': [
+        {'toolSpec': {'name': 'getToc', 'description': 'd',
+                      'inputSchema': {'json': {'type': 'object'}}}}]}
+    assert body['messages'][0] == {'role': 'assistant', 'content': blocks}
+    assert body['messages'][1] == {'role': 'user', 'content': [
+        {'toolResult': {'toolUseId': 'tu_1',
+                        'content': [{'text': '{"toc": []}'}],
+                        'status': 'success'}},
+        {'toolResult': {'toolUseId': 'tu_2', 'content': [{'text': 'boom'}],
+                        'status': 'error'}},
+    ]}
+
+
 @pytest.mark.asyncio
 async def test_chat_bedrock_converse_basic_flow():
     handler = MagicMock()
-    json_text = '{"messages":[{"role":"assistant","content":"Hi there!"}],"actions":[]}'
 
-    # Stream simulates Bedrock Converse: text deltas, block stop, message stop.
+    # Stream simulates Bedrock Converse: raw text deltas, block stop, msg stop.
     chunks = [
         _encode_es_frame(
             {':event-type': 'contentBlockDelta', ':message-type': 'event'},
-            json.dumps({'delta': {'text': '{"messages":[{"role":"assistant","content":"Hi'}}),
+            json.dumps({'contentBlockIndex': 0, 'delta': {'text': 'Hi'}}),
         ),
         _encode_es_frame(
             {':event-type': 'contentBlockDelta', ':message-type': 'event'},
-            json.dumps({'delta': {'text': ' there!"}],"actions":[]}'}}),
+            json.dumps({'contentBlockIndex': 0, 'delta': {'text': ' there!'}}),
         ),
         _encode_es_frame(
             {':event-type': 'contentBlockStop', ':message-type': 'event'},
@@ -1613,13 +1800,14 @@ async def test_chat_bedrock_converse_basic_flow():
     text_deltas = [p['delta'] for p in payloads
                    if p['type'] == 'content_block_delta'
                    and p['content_type'] == 'text']
-    # _extract_json_content extracts the running 'content' field value.
-    assert text_deltas[0] == 'Hi'
-    assert text_deltas[-1] == 'Hi there!'
+    # Raw text deltas emitted verbatim (incremental).
+    assert text_deltas == ['Hi', ' there!']
 
     done = [p for p in payloads if p['type'] == 'message_done'][0]
-    assert done['text'] == json_text
+    assert done['text'] == 'Hi there!'
     assert done['stop_reason'] == 'end_turn'
+    assert done['tool_calls'] == []
+    assert done['assistant_blocks'] == [{'text': 'Hi there!'}]
 
     assert written[-1] == 'data: [DONE]\n\n'
 
@@ -1630,20 +1818,22 @@ async def test_chat_bedrock_converse_thinking_then_text():
     chunks = [
         _encode_es_frame(
             {':event-type': 'contentBlockDelta', ':message-type': 'event'},
-            json.dumps({'delta': {'reasoningContent': {'text': 'Let me think'}}}),
+            json.dumps({'contentBlockIndex': 0,
+                        'delta': {'reasoningContent': {'text': 'Let me think'}}}),
         ),
         _encode_es_frame(
             {':event-type': 'contentBlockDelta', ':message-type': 'event'},
-            json.dumps({'delta': {'reasoningContent': {'text': ' about this.'}}}),
+            json.dumps({'contentBlockIndex': 0,
+                        'delta': {'reasoningContent': {'text': ' about this.'}}}),
         ),
         # Switch to text block; emitter must close thinking and open text.
         _encode_es_frame(
             {':event-type': 'contentBlockDelta', ':message-type': 'event'},
-            json.dumps({'delta': {'text': '{"messages":[{"role":"assistant","content":"Done"}]}'}}),
+            json.dumps({'contentBlockIndex': 1, 'delta': {'text': 'Done'}}),
         ),
         _encode_es_frame(
             {':event-type': 'contentBlockStop', ':message-type': 'event'},
-            json.dumps({}),
+            json.dumps({'contentBlockIndex': 1}),
         ),
         _encode_es_frame(
             {':event-type': 'messageStop', ':message-type': 'event'},
@@ -1671,6 +1861,54 @@ async def test_chat_bedrock_converse_thinking_then_text():
                        if p['type'] == 'content_block_delta'
                        and p['content_type'] == 'thinking']
     assert thinking_deltas == ['Let me think', ' about this.']
+
+
+@pytest.mark.asyncio
+async def test_chat_bedrock_converse_tool_use():
+    handler = MagicMock()
+    chunks = [
+        _encode_es_frame(
+            {':event-type': 'contentBlockStart', ':message-type': 'event'},
+            json.dumps({'contentBlockIndex': 0, 'start': {'toolUse': {
+                'toolUseId': 'tu_1', 'name': 'getToc'}}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'contentBlockIndex': 0,
+                        'delta': {'toolUse': {'input': '{"dep'}}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'contentBlockIndex': 0,
+                        'delta': {'toolUse': {'input': 'th": 2}'}}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockStop', ':message-type': 'event'},
+            json.dumps({'contentBlockIndex': 0}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'messageStop', ':message-type': 'event'},
+            json.dumps({'stopReason': 'tool_use'}),
+        ),
+    ]
+    response = _FakeStreamResponse(status_code=200, chunks=chunks)
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeAsyncClient(response, {})):
+        await chat_bedrock_converse(
+            handler, 'k', 'us-east-1',
+            'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+            [], tools=[{'name': 'getToc', 'description': 'd',
+                        'parameters': {'type': 'object'}}],
+        )
+
+    payloads, _ = _parse_sse_payloads(handler)
+    done = [p for p in payloads if p['type'] == 'message_done'][0]
+    assert done['stop_reason'] == 'tool_use'
+    assert done['tool_calls'] == [
+        {'id': 'tu_1', 'name': 'getToc', 'input': {'depth': 2}}]
+    assert done['assistant_blocks'] == [
+        {'toolUse': {'toolUseId': 'tu_1', 'name': 'getToc',
+                     'input': {'depth': 2}}}]
 
 
 @pytest.mark.asyncio

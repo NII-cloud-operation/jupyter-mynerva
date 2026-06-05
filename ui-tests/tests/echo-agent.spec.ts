@@ -39,8 +39,8 @@ test.describe('Echo Agent', () => {
     const shareButton = actionCard.getByText('Share');
     await shareButton.click();
 
-    // Wait for echo response (the last assistant message after action results)
-    // The echo agent echoes back the [Action Results] content
+    // Wait for echo response (the last assistant message after tool results)
+    // The echo agent echoes back the tool result content
     const allMessages = panel.locator(
       '.jp-Mynerva-message.jp-Mynerva-assistant .jp-Mynerva-message-content'
     );
@@ -78,8 +78,8 @@ test.describe('Echo Agent', () => {
   test('listHelp returns system prompt', async ({ page }) => {
     await page.getByRole('tab', { name: 'Mynerva' }).click();
     const result = await sendAndApprove(page, 'list help', 'listHelp');
-    expect(result).toContain('Available actions');
-    expect(result).toContain('getToc');
+    expect(result).toContain('Mynerva');
+    expect(result).toContain('updateCell');
   });
 
   test('help returns action details', async ({ page }) => {
