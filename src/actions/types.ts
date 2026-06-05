@@ -173,8 +173,10 @@ export interface IRunCellAction {
 export type ActionStatus =
   | 'pending'
   | 'approved'
+  | 'executing'
   | 'executed'
   | 'rejected'
+  | 'cancelled'
   | 'notified';
 
 /**

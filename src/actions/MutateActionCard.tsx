@@ -8,6 +8,8 @@ interface IMutateActionCardProps {
   onApprove: () => void;
   onApproveAlways: () => void;
   onReject: () => void;
+  onCancel?: () => void;
+  progress?: string;
 }
 
 function getActionLabel(action: IMutateAction): string {
@@ -40,12 +42,15 @@ export function MutateActionCard({
   status,
   onApprove,
   onApproveAlways,
-  onReject
+  onReject,
+  onCancel,
+  progress
 }: IMutateActionCardProps): React.ReactElement {
   const [showPreview, setShowPreview] = React.useState(false);
   const label = getActionLabel(action);
   const previewContent = getPreviewContent(action);
-  const isCompleted = status === 'executed' || status === 'notified';
+  const isCompleted =
+    status === 'executed' || status === 'notified' || status === 'cancelled';
 
   return (
     <div
@@ -90,9 +95,29 @@ export function MutateActionCard({
           Approved
         </div>
       )}
+      {status === 'executing' && (
+        <div className="jp-Mynerva-action-executing">
+          <span className="jp-Mynerva-action-badge jp-Mynerva-executing-badge">
+            {progress ? `Running… (${progress})` : 'Running…'}
+          </span>
+          {onCancel && (
+            <button
+              className="jp-Mynerva-action-button jp-Mynerva-cancel-button"
+              onClick={onCancel}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
       {status === 'executed' && (
         <div className="jp-Mynerva-action-badge jp-Mynerva-applied-badge">
           Applied
+        </div>
+      )}
+      {status === 'cancelled' && (
+        <div className="jp-Mynerva-action-badge jp-Mynerva-cancelled-badge">
+          Cancelled
         </div>
       )}
       {(status === 'rejected' || status === 'notified') && (

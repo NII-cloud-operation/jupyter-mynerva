@@ -381,10 +381,57 @@ async function saveSession(
   }
 }
 
+// LLM targets stream SSE (so a reverse proxy never times out a multi-minute
+// summarization and we can show progress); the LLM-free target is plain JSON.
+const NBSEARCH_STREAMING_TARGETS = ['notebooks', 'summary-cells-from-search'];
+
+async function readNBSearchSSE(
+  response: Response,
+  onProgress?: (event: Record<string, unknown>) => void
+): Promise<unknown> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: unknown;
+  let done = false;
+  while (!done) {
+    const { done: streamDone, value } = await reader.read();
+    if (streamDone) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Ignore SSE comments (heartbeats) and non-data lines.
+      if (!trimmed || !trimmed.startsWith('data: ')) {
+        continue;
+      }
+      const payload = trimmed.slice('data: '.length);
+      if (payload === '[DONE]') {
+        done = true;
+        break;
+      }
+      const event = JSON.parse(payload);
+      if (event.type === 'progress') {
+        onProgress?.(event);
+      } else if (event.type === 'done') {
+        result = event.result;
+      } else if (event.type === 'error') {
+        throw new Error(event.error || 'nbsearch request failed');
+      }
+    }
+  }
+  return result;
+}
+
 async function callNBSearch(
   target: 'notebooks' | 'summary-cells-from-search' | 'cells-from-search',
   action: IAction,
-  filterEnabled: boolean
+  filterEnabled: boolean,
+  signal?: AbortSignal,
+  onProgress?: (event: Record<string, unknown>) => void
 ): Promise<unknown> {
   const settings = ServerConnection.makeSettings();
   const url = `${settings.baseUrl}jupyter-mynerva/nbsearch/${target}`;
@@ -395,15 +442,38 @@ async function callNBSearch(
       body: JSON.stringify({
         ...normalizeSearchNotebooksAction(action),
         noFilter: !filterEnabled || undefined
-      })
+      }),
+      ...(signal && { signal })
     },
     settings
   );
+  if (NBSEARCH_STREAMING_TARGETS.includes(target)) {
+    if (!response.ok) {
+      let message = `nbsearch ${target} failed`;
+      try {
+        message = (await response.json()).error || message;
+      } catch {
+        // Non-JSON transport error; keep the generic message.
+      }
+      throw new Error(message);
+    }
+    return readNBSearchSSE(response, onProgress);
+  }
   const body = await response.json();
   if (!response.ok) {
     throw new Error(body.error || `nbsearch ${target} failed`);
   }
   return body;
+}
+
+function formatActionProgress(event: Record<string, unknown>): string {
+  if (event.phase === 'notebook') {
+    return `notebook ${event.current}/${event.total}`;
+  }
+  if (event.phase === 'summarize') {
+    return typeof event.detail === 'string' ? event.detail : 'summarizing…';
+  }
+  return '';
 }
 
 function parseLocalDate(value: string): Date | null {
@@ -1016,6 +1086,8 @@ interface IChatViewProps {
     action: IAction
   ) => void;
   onActionReject: (msgIndex: number, actionIndex: number) => void;
+  onActionCancel: () => void;
+  actionProgress: string;
   onAcceptAll: (msgIndex: number) => void;
   onAcceptAllAlways: (msgIndex: number) => void;
   onRejectAll: (msgIndex: number) => void;
@@ -1046,6 +1118,8 @@ function ChatView({
   onActionApprove,
   onActionApproveAlways,
   onActionReject,
+  onActionCancel,
+  actionProgress,
   onAcceptAll,
   onAcceptAllAlways,
   onRejectAll,
@@ -1179,6 +1253,8 @@ function ChatView({
                             onReject={() =>
                               onActionReject(msgIndex, actionIndex)
                             }
+                            onCancel={onActionCancel}
+                            progress={actionProgress}
                           />
                         ) : null
                       )}
@@ -1206,6 +1282,8 @@ function ChatView({
                             onReject={() =>
                               onActionReject(msgIndex, actionIndex)
                             }
+                            onCancel={onActionCancel}
+                            progress={actionProgress}
                           />
                         ) : null
                       )}
@@ -1409,6 +1487,10 @@ function MynervaComponent({
 
   // Flag to prevent duplicate execution from useEffect during batch operations
   const executingActionsRef = React.useRef(false);
+  // Aborts the action currently being executed (e.g. a slow nbsearch summary)
+  const actionAbortRef = React.useRef<AbortController | null>(null);
+  // Progress text for the action currently executing (shown on its card)
+  const [actionProgress, setActionProgress] = React.useState('');
 
   // Auto-save session when messages change
   React.useEffect(() => {
@@ -1471,7 +1553,11 @@ function MynervaComponent({
     }
   };
 
-  const executeQueryAction = async (action: IAction): Promise<string> => {
+  const executeQueryAction = async (
+    action: IAction,
+    signal?: AbortSignal,
+    onProgress?: (event: Record<string, unknown>) => void
+  ): Promise<string> => {
     let result: string;
     switch (action.type) {
       case 'getToc': {
@@ -1578,7 +1664,9 @@ function MynervaComponent({
         const searchResult = await callNBSearch(
           'notebooks',
           action,
-          filterEnabled
+          filterEnabled,
+          signal,
+          onProgress
         );
         result = JSON.stringify(
           { type: 'searchNotebooks', result: searchResult },
@@ -1591,7 +1679,9 @@ function MynervaComponent({
         const searchResult = await callNBSearch(
           'summary-cells-from-search',
           action,
-          filterEnabled
+          filterEnabled,
+          signal,
+          onProgress
         );
         result = JSON.stringify(
           { type: 'summaryCellsFromSearch', result: searchResult },
@@ -1604,7 +1694,8 @@ function MynervaComponent({
         const searchResult = await callNBSearch(
           'cells-from-search',
           action,
-          filterEnabled
+          filterEnabled,
+          signal
         );
         result = JSON.stringify(
           { type: 'getCellsFromSearch', result: searchResult },
@@ -1696,19 +1787,44 @@ function MynervaComponent({
     setActionStatus(msgIndex, actionIndex, 'rejected');
   };
 
+  const handleActionCancel = () => {
+    actionAbortRef.current?.abort();
+  };
+
   const executeApprovedAction = async (
     msgIndex: number,
     actionIndex: number,
     action: IAction,
-    toolCallId: string
+    toolCallId: string,
+    signal?: AbortSignal
   ) => {
     let toolResult: IToolResult;
+    setActionProgress('');
     try {
       const result = isQueryAction(action)
-        ? await executeQueryAction(action)
+        ? await executeQueryAction(action, signal, event =>
+            setActionProgress(formatActionProgress(event))
+          )
         : await executeMutateAction(action);
       toolResult = { id: toolCallId, result };
     } catch (e) {
+      // User-initiated cancellation: record it and stop, don't surface as error.
+      if (signal?.aborted || (e instanceof Error && e.name === 'AbortError')) {
+        setPendingResults(prev => [
+          ...prev,
+          {
+            id: toolCallId,
+            result: JSON.stringify(
+              { type: action.type, cancelled: true },
+              null,
+              2
+            ),
+            isError: true
+          }
+        ]);
+        setActionStatus(msgIndex, actionIndex, 'cancelled');
+        return;
+      }
       console.error('Action failed:', action.type, e);
       toolResult = {
         id: toolCallId,
@@ -1874,6 +1990,8 @@ function MynervaComponent({
 
     const executeBatch = async () => {
       executingActionsRef.current = true;
+      const controller = new AbortController();
+      actionAbortRef.current = controller;
       try {
         for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
           const toolCalls = messages[msgIndex].toolCalls || [];
@@ -1900,15 +2018,45 @@ function MynervaComponent({
             continue;
           }
 
-          // Process in order: execute approved, notify rejected
+          // Process in order: execute approved, notify rejected. Every tool
+          // call must get a result (provider pairing), so on cancellation the
+          // remaining ones are answered with a cancelled result too.
           for (let i = 0; i < toolCalls.length; i++) {
+            if (controller.signal.aborted) {
+              for (let j = i; j < toolCalls.length; j++) {
+                const st = getActionStatus(msgIndex, j);
+                if (
+                  st === 'executed' ||
+                  st === 'notified' ||
+                  st === 'cancelled'
+                ) {
+                  continue;
+                }
+                setPendingResults(prev => [
+                  ...prev,
+                  {
+                    id: toolCalls[j].id,
+                    result: JSON.stringify(
+                      { type: toolCalls[j].name, cancelled: true },
+                      null,
+                      2
+                    ),
+                    isError: true
+                  }
+                ]);
+                setActionStatus(msgIndex, j, 'cancelled');
+              }
+              break;
+            }
             const status = getActionStatus(msgIndex, i);
             if (status === 'approved') {
+              setActionStatus(msgIndex, i, 'executing');
               await executeApprovedAction(
                 msgIndex,
                 i,
                 toolCallToAction(toolCalls[i]),
-                toolCalls[i].id
+                toolCalls[i].id,
+                controller.signal
               );
             } else if (status === 'rejected') {
               const result = JSON.stringify(
@@ -1926,6 +2074,8 @@ function MynervaComponent({
         }
       } finally {
         executingActionsRef.current = false;
+        actionAbortRef.current = null;
+        setActionProgress('');
       }
     };
 
@@ -2316,6 +2466,8 @@ function MynervaComponent({
           onActionApprove={handleActionApprove}
           onActionApproveAlways={handleActionApproveAlways}
           onActionReject={handleActionReject}
+          onActionCancel={handleActionCancel}
+          actionProgress={actionProgress}
           onAcceptAll={handleAcceptAll}
           onAcceptAllAlways={handleAcceptAllAlways}
           onRejectAll={handleRejectAll}

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -47,12 +48,13 @@ from jupyter_mynerva.handlers.nbsearch import (
     _NBSEARCH_CELLS_PAGE_LIMIT_BYTES,
     _NBSEARCH_REFERENCE_CACHE,
     NBSearchHandler,
-    _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES,
     _build_nbsearch_filter_queries,
     _build_nbsearch_query,
     _paginate_cells_result,
-    _prepare_cells_summary_input,
-    _prepare_summary_cells,
+    _source_only_cells,
+    _NBSEARCH_SUMMARY_MAX_DEPTH,
+    _is_context_exceeded,
+    _truncate_for_floor,
 )
 
 
@@ -257,51 +259,73 @@ def test_build_nbsearch_filter_queries_uses_normalized_datetime_range():
     ]
 
 
-def test_prepare_summary_cells_keeps_full_cells_under_budget():
-    cells = [{
-        'referenceId': 'search/r1/ref1',
-        'cells': {
-            'cells': [{
-                'cell_type': 'code',
-                'source': ['print(1)'],
-                'outputs': [{'text': ['small output']}],
-                'metadata': {'lc_cell_meme': {'current': 'meme'}},
-                '_hash': 'hash',
-            }],
-        },
-    }]
-
-    assert _prepare_summary_cells(cells) == cells
-
-
-def test_prepare_summary_cells_strips_outputs_and_metadata_over_budget():
-    cells = [{
-        'referenceId': 'search/r1/ref1',
-        'cells': {
-            'cells': [{
+def test_source_only_cells_flattens_and_drops_outputs():
+    cells_result = {
+        'cells': [
+            {
                 '_index': 10,
                 'cell_type': 'code',
                 'source': ['print(1)'],
-                'outputs': [{'text': ['x' * _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES]}],
+                'outputs': [{'text': ['big output']}],
                 'metadata': {'lc_cell_meme': {'current': 'meme'}},
                 'execution_count': 1,
                 '_hash': 'hash',
-            }],
-            'error': 'partial',
-        },
-    }]
+            },
+            {
+                '_index': 11,
+                'cell_type': 'markdown',
+                'source': ['# title'],
+            },
+        ],
+    }
 
-    assert _prepare_summary_cells(cells) == [{
-        'referenceId': 'search/r1/ref1',
-        'cells': {
-            'cells': [{
-                '_index': 10,
-                'cell_type': 'code',
-                'source': ['print(1)'],
-            }],
-            'error': 'partial',
-        },
-    }]
+    assert _source_only_cells(cells_result) == [
+        {'_index': 10, 'cell_type': 'code', 'source': ['print(1)']},
+        {'_index': 11, 'cell_type': 'markdown', 'source': ['# title']},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_summarize_feeds_flat_source_only_cell_list_to_map_reduce(monkeypatch):
+    # Regression: map-reduce must receive the actual cell list (so it can split
+    # to fit context), not a single wrapper object.
+    async def fake_load_config():
+        return {}
+
+    async def fake_resolve(config):
+        return ('openai', 'm', 'k', '')
+
+    monkeypatch.setattr('jupyter_mynerva.routes.load_config', fake_load_config)
+    monkeypatch.setattr('jupyter_mynerva.routes.resolve_chat_config', fake_resolve)
+
+    captured = {}
+
+    async def fake_adaptive(provider, model, api_key, base_url, config,
+                            build_messages, segments):
+        captured['segments'] = segments
+        captured['payload'] = json.loads(build_messages(segments)[1]['content'])
+        return 'summary'
+
+    handler = MagicMock()
+    handler._summarize_adaptive = fake_adaptive
+
+    cells_result = {
+        'cells': [
+            {'_index': 0, 'cell_type': 'code', 'source': ['a'], 'outputs': ['x']},
+            {'_index': 1, 'cell_type': 'code', 'source': ['b']},
+        ],
+    }
+
+    out = await NBSearchHandler._summarize(
+        handler, 'focus', 'f.ipynb', cells_result, 'instruction', 'echo-text')
+
+    assert out == 'summary'
+    # Flat list of source-only cells (outputs dropped), each keeping _index.
+    assert captured['segments'] == [
+        {'_index': 0, 'cell_type': 'code', 'source': ['a']},
+        {'_index': 1, 'cell_type': 'code', 'source': ['b']},
+    ]
+    assert captured['payload']['cells'] == captured['segments']
 
 
 def test_paginate_cells_result_uses_budget_and_next_start():
@@ -442,22 +466,6 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
         ],
     }
     assert result['results'][0]['references'][0]['referenceId'].endswith('/ref1')
-
-
-def test_prepare_cells_summary_input_reports_sampled_coverage():
-    cells = {
-        'cells': [
-            {'_index': index, 'cell_type': 'code', 'source': 'print(1)', 'outputs': ['x' * 100]}
-            for index in range(10)
-        ],
-    }
-
-    result, coverage = _prepare_cells_summary_input(cells, budget=500)
-
-    assert coverage.startswith('sampled ')
-    assert coverage.endswith('/10 cells')
-    assert len(result) < 10
-    assert all('outputs' not in cell for cell in result)
 
 
 @pytest.mark.asyncio
@@ -638,21 +646,38 @@ async def test_get_search_reference_cells_returns_empty_for_invalid_payload(monk
 
 @pytest.mark.asyncio
 async def test_nbsearch_handler_returns_json_for_unhandled_errors():
+    # The cheap LLM-free target stays a plain JSON request.
     handler = MagicMock()
-    handler.current_user = 'user'
-    handler.get_json_body.return_value = {'query': 'pandas', 'focus': 'usage'}
-    handler._search_notebooks = AsyncMock(side_effect=RuntimeError('provider unavailable'))
+    handler._run_target = AsyncMock(side_effect=RuntimeError('provider unavailable'))
 
-    await NBSearchHandler.post(handler, 'notebooks')
+    await NBSearchHandler._post_json(handler, 'cells-from-search', {'referenceId': 'r1'})
 
     handler.log.exception.assert_called_once_with(
         'Unhandled nbsearch request failure: target=%s',
-        'notebooks',
+        'cells-from-search',
     )
     handler.set_status.assert_called_once_with(500)
     assert json.loads(handler.finish.call_args[0][0]) == {
         'error': 'nbsearch request failed; see server logs',
     }
+
+
+@pytest.mark.asyncio
+async def test_nbsearch_handler_streams_error_event_for_unhandled_errors():
+    # LLM targets stream SSE, so errors arrive as an SSE error event.
+    handler = MagicMock()
+    handler._run_target = AsyncMock(side_effect=RuntimeError('provider unavailable'))
+    handler._sse_heartbeat = AsyncMock()
+
+    await NBSearchHandler._post_streaming(handler, 'notebooks', {'query': 'q', 'focus': 'f'})
+
+    handler.log.exception.assert_called_once_with(
+        'Unhandled nbsearch request failure: target=%s',
+        'notebooks',
+    )
+    writes = ''.join(call.args[0] for call in handler.write.call_args_list)
+    assert '"type": "error"' in writes
+    assert '[DONE]' in writes
 
 
 # --- _fetch_openai_models ---
@@ -2726,4 +2751,125 @@ async def test_get_default_config_multi_provider_with_explicit(monkeypatch):
 
     defaults = await get_default_config()
     assert defaults['provider'] == 'bedrock'
+
+
+# --- nbsearch summary context-overflow map-reduce ---
+
+
+@pytest.mark.parametrize('message', [
+    'request (12700 tokens) exceeds the available context size (4096 tokens)',
+    "This model's maximum context length is 4096 tokens",
+    'Error code: 400 - context_length_exceeded',
+    'prompt is larger than the context window',
+])
+def test_is_context_exceeded_matches_known_errors(message):
+    assert _is_context_exceeded(RuntimeError(message))
+
+
+@pytest.mark.parametrize('message', [
+    'invalid api key',
+    'rate limit reached',
+    'connection refused',
+])
+def test_is_context_exceeded_ignores_other_errors(message):
+    assert not _is_context_exceeded(RuntimeError(message))
+
+
+def test_truncate_for_floor_clips_nested_strings():
+    value = {'source': 'x' * 5000, 'cells': [{'text': 'y' * 5000}], 'n': 3}
+    clipped = _truncate_for_floor(value, limit=10)
+    assert clipped['source'] == 'x' * 10
+    assert clipped['cells'][0]['text'] == 'y' * 10
+    assert clipped['n'] == 3
+
+
+class _FakeSummarizer:
+    """Duck-typed stand-in exercising NBSearchHandler._summarize_adaptive.
+
+    `_run_summary` fails with a context-overflow error whenever it is given
+    more than `max_fit` cells, so the recursion is forced to split.
+    """
+
+    _summarize_adaptive = NBSearchHandler._summarize_adaptive
+    _emit_progress = NBSearchHandler._emit_progress
+    _on_progress = None
+
+    def __init__(self, max_fit):
+        self.max_fit = max_fit
+        self.log = logging.getLogger('test-nbsearch')
+        self.sizes = []
+
+    async def _run_summary(self, provider, model, api_key, base_url, config,
+                           messages):
+        cells = json.loads(messages[1]['content'])['cells']
+        self.sizes.append(len(cells))
+        if len(cells) > self.max_fit:
+            raise RuntimeError('exceeds the available context size')
+        return f'summary-of-{len(cells)}'
+
+
+def _build_summary_messages(segments):
+    return [
+        {'role': 'system', 'content': 'summarize'},
+        {'role': 'user', 'content': json.dumps({'cells': segments})},
+    ]
+
+
+async def test_summarize_adaptive_single_shot_when_it_fits():
+    fake = _FakeSummarizer(max_fit=10)
+    result = await fake._summarize_adaptive(
+        'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3])
+    assert result == 'summary-of-3'
+    assert fake.sizes == [3]  # no split
+
+
+async def test_summarize_adaptive_map_reduce_on_overflow():
+    # Chunks larger than 2 cells overflow, forcing a split of the 4-cell input.
+    fake = _FakeSummarizer(max_fit=2)
+    result = await fake._summarize_adaptive(
+        'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
+    assert result.startswith('summary-of-')
+    # First attempt (4) overflows; halves of 2 fit; reduce of 2 partials fits.
+    assert fake.sizes[0] == 4
+    assert 2 in fake.sizes
+
+
+async def test_summarize_adaptive_propagates_non_context_errors():
+    class _Boom(_FakeSummarizer):
+        async def _run_summary(self, *args, **kwargs):
+            raise ValueError('bad api key')
+
+    fake = _Boom(max_fit=2)
+    with pytest.raises(ValueError):
+        await fake._summarize_adaptive(
+            'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
+    # No split attempted on a non-context error.
+    assert fake.sizes == []
+
+
+async def test_summarize_adaptive_depth_is_bounded():
+    # Nothing ever fits, so the floor (truncate + final attempt) must raise
+    # rather than recurse forever.
+    fake = _FakeSummarizer(max_fit=0)
+    with pytest.raises(RuntimeError):
+        await fake._summarize_adaptive(
+            'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
+    # Bounded: never explodes into an unbounded number of calls.
+    assert len(fake.sizes) <= 2 ** (_NBSEARCH_SUMMARY_MAX_DEPTH + 2)
+
+
+async def test_summarize_adaptive_propagates_cancellation():
+    # A client-disconnect cancellation must abort, never be mistaken for a
+    # context overflow and trigger map-reduce.
+    class _Cancelled(_FakeSummarizer):
+        async def _run_summary(self, *args, **kwargs):
+            self.sizes.append(0)
+            raise asyncio.CancelledError()
+
+    fake = _Cancelled(max_fit=2)
+    with pytest.raises(asyncio.CancelledError):
+        await fake._summarize_adaptive(
+            'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
+    # Only the first attempt ran; no split.
+    assert fake.sizes == [0]
 
