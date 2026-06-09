@@ -718,9 +718,13 @@ function EnkiGateSettings({
         </div>
       )}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
-      {!connecting && (
-        <button className="jp-Mynerva-settings-save" onClick={startDeviceFlow}>
-          {tokenValid ? 'Reconnect' : 'Connect'}
+      {!verificationUri && (
+        <button
+          className="jp-Mynerva-settings-save"
+          onClick={startDeviceFlow}
+          disabled={connecting}
+        >
+          {connecting ? 'Connecting...' : tokenValid ? 'Reconnect' : 'Connect'}
         </button>
       )}
     </>
