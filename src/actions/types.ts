@@ -1,11 +1,23 @@
 import { ICellQuery } from '../context';
 
 /**
- * LLM response structure
+ * A tool call emitted by the LLM via the provider's native tool-calling API.
+ * `name` is the action type; `input` is the action's arguments. Together they
+ * reconstruct an IAction for execution: `{ type: name, ...input }`.
  */
-export interface ILLMResponse {
-  messages: Array<{ role: 'assistant'; content: string }>;
-  actions: IAction[];
+export interface IToolCall {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * The result of executing a tool call, sent back to the LLM as a tool result.
+ */
+export interface IToolResult {
+  id: string;
+  result: string;
+  isError?: boolean;
 }
 
 /**
@@ -161,8 +173,10 @@ export interface IRunCellAction {
 export type ActionStatus =
   | 'pending'
   | 'approved'
+  | 'executing'
   | 'executed'
   | 'rejected'
+  | 'cancelled'
   | 'notified';
 
 /**

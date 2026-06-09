@@ -16,12 +16,14 @@ import {
   IQueryAction,
   IMutateAction,
   IListNotebookFilesAction,
+  IToolCall,
+  IToolResult,
   ISearchNotebooksAction,
   IGetCellsFromSearchAction,
   ISummaryCellsFromSearchAction,
   ActionStatus,
-  parseRawContent,
-  validateActions,
+  IToolDefinition,
+  getToolDefinitions,
   QueryActionCard,
   MutateActionCard,
   DropdownButton
@@ -41,8 +43,22 @@ const PANEL_CLASS = 'jp-Mynerva-panel';
 interface IMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
-  actions?: IAction[];
+  // Assistant: tool calls extracted for the UI / execution.
+  toolCalls?: IToolCall[];
+  // Assistant: provider-native content blocks, kept opaque and resent verbatim
+  // so reasoning/thinking signatures round trip.
+  assistantBlocks?: unknown;
+  // User: results of executed tool calls, sent back to the LLM.
+  toolResults?: IToolResult[];
   generated?: boolean; // Auto-generated messages (show brief in UI)
+}
+
+/** The completed result of one streamed chat turn. */
+interface IChatResult {
+  text: string;
+  stopReason?: string;
+  toolCalls: IToolCall[];
+  assistantBlocks?: unknown;
 }
 
 interface IConfig {
@@ -87,30 +103,6 @@ interface IProvidersResponse {
   defaultsError?: string;
   nbsearchAvailable?: boolean;
   bedrockRegions: IBedrockRegion[];
-}
-
-function getSearchCellsContinuationHint(results: string[]): string | null {
-  for (const result of results) {
-    try {
-      const parsed = JSON.parse(result);
-      const actionResult = parsed?.result?.result;
-      if (
-        parsed?.type === 'getCellsFromSearch' &&
-        actionResult?.hasMore === true &&
-        typeof actionResult.nextStart === 'number'
-      ) {
-        return [
-          '[Instruction]',
-          'The getCellsFromSearch result has hasMore=true.',
-          'If the user asked to continue reading, respond with JSON containing the next getCellsFromSearch action using the same referenceId and start=nextStart.',
-          'Do not provide the final summary until hasMore is false or the requested reading is complete.'
-        ].join('\n');
-      }
-    } catch {
-      // Non-JSON action feedback is passed through without an additional hint.
-    }
-  }
-  return null;
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -205,14 +197,15 @@ interface IStreamCallbacks {
     contentType: string,
     metadata?: Record<string, unknown>
   ) => void;
-  onMessageDone: (text: string, stopReason?: string) => void;
+  onMessageDone: (result: IChatResult) => void;
 }
 
 async function sendChat(
   messages: IMessage[],
+  tools: IToolDefinition[],
   callbacks: IStreamCallbacks,
   signal?: AbortSignal
-): Promise<string> {
+): Promise<IChatResult> {
   const settings = ServerConnection.makeSettings();
   const url = `${settings.baseUrl}jupyter-mynerva/chat`;
 
@@ -220,7 +213,7 @@ async function sendChat(
     url,
     {
       method: 'POST',
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ messages, tools }),
       ...(signal && { signal })
     },
     settings
@@ -233,7 +226,7 @@ async function sendChat(
 
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
-  let doneText = '';
+  let result: IChatResult = { text: '', toolCalls: [] };
   let buffer = '';
   let reading = true;
 
@@ -256,7 +249,7 @@ async function sendChat(
       }
       const payload = trimmed.slice(6);
       if (payload === '[DONE]') {
-        return doneText;
+        return result;
       }
       try {
         const parsed = JSON.parse(payload);
@@ -270,8 +263,13 @@ async function sendChat(
         } else if (parsed.type === 'content_block_stop') {
           callbacks.onContentBlockStop(parsed.content_type, parsed);
         } else if (parsed.type === 'message_done') {
-          doneText = parsed.text;
-          callbacks.onMessageDone(parsed.text, parsed.stop_reason);
+          result = {
+            text: parsed.text,
+            stopReason: parsed.stop_reason,
+            toolCalls: parsed.tool_calls || [],
+            assistantBlocks: parsed.assistant_blocks
+          };
+          callbacks.onMessageDone(result);
         }
       } catch (e) {
         if (e instanceof SyntaxError) {
@@ -282,7 +280,7 @@ async function sendChat(
     }
   }
 
-  return doneText;
+  return result;
 }
 
 function humanizeTime(isoString: string): string {
@@ -383,10 +381,57 @@ async function saveSession(
   }
 }
 
+// LLM targets stream SSE (so a reverse proxy never times out a multi-minute
+// summarization and we can show progress); the LLM-free target is plain JSON.
+const NBSEARCH_STREAMING_TARGETS = ['notebooks', 'summary-cells-from-search'];
+
+async function readNBSearchSSE(
+  response: Response,
+  onProgress?: (event: Record<string, unknown>) => void
+): Promise<unknown> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: unknown;
+  let done = false;
+  while (!done) {
+    const { done: streamDone, value } = await reader.read();
+    if (streamDone) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Ignore SSE comments (heartbeats) and non-data lines.
+      if (!trimmed || !trimmed.startsWith('data: ')) {
+        continue;
+      }
+      const payload = trimmed.slice('data: '.length);
+      if (payload === '[DONE]') {
+        done = true;
+        break;
+      }
+      const event = JSON.parse(payload);
+      if (event.type === 'progress') {
+        onProgress?.(event);
+      } else if (event.type === 'done') {
+        result = event.result;
+      } else if (event.type === 'error') {
+        throw new Error(event.error || 'nbsearch request failed');
+      }
+    }
+  }
+  return result;
+}
+
 async function callNBSearch(
   target: 'notebooks' | 'summary-cells-from-search' | 'cells-from-search',
   action: IAction,
-  filterEnabled: boolean
+  filterEnabled: boolean,
+  signal?: AbortSignal,
+  onProgress?: (event: Record<string, unknown>) => void
 ): Promise<unknown> {
   const settings = ServerConnection.makeSettings();
   const url = `${settings.baseUrl}jupyter-mynerva/nbsearch/${target}`;
@@ -397,15 +442,38 @@ async function callNBSearch(
       body: JSON.stringify({
         ...normalizeSearchNotebooksAction(action),
         noFilter: !filterEnabled || undefined
-      })
+      }),
+      ...(signal && { signal })
     },
     settings
   );
+  if (NBSEARCH_STREAMING_TARGETS.includes(target)) {
+    if (!response.ok) {
+      let message = `nbsearch ${target} failed`;
+      try {
+        message = (await response.json()).error || message;
+      } catch {
+        // Non-JSON transport error; keep the generic message.
+      }
+      throw new Error(message);
+    }
+    return readNBSearchSSE(response, onProgress);
+  }
   const body = await response.json();
   if (!response.ok) {
     throw new Error(body.error || `nbsearch ${target} failed`);
   }
   return body;
+}
+
+function formatActionProgress(event: Record<string, unknown>): string {
+  if (event.phase === 'notebook') {
+    return `notebook ${event.current}/${event.total}`;
+  }
+  if (event.phase === 'summarize') {
+    return typeof event.detail === 'string' ? event.detail : 'summarizing…';
+  }
+  return '';
 }
 
 function parseLocalDate(value: string): Date | null {
@@ -650,9 +718,13 @@ function EnkiGateSettings({
         </div>
       )}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
-      {!connecting && (
-        <button className="jp-Mynerva-settings-save" onClick={startDeviceFlow}>
-          {tokenValid ? 'Reconnect' : 'Connect'}
+      {!verificationUri && (
+        <button
+          className="jp-Mynerva-settings-save"
+          onClick={startDeviceFlow}
+          disabled={connecting}
+        >
+          {connecting ? 'Connecting...' : tokenValid ? 'Reconnect' : 'Connect'}
         </button>
       )}
     </>
@@ -959,6 +1031,32 @@ function isMutateAction(action: IAction): action is IMutateAction {
   return MUTATE_ACTION_TYPES.includes(action.type);
 }
 
+/** Reconstruct an executable IAction from a native tool call. */
+function toolCallToAction(toolCall: IToolCall): IAction {
+  return { type: toolCall.name, ...toolCall.input } as IAction;
+}
+
+// How many times to feed validation errors back to the model before giving up
+// and presenting the turn as-is.
+const MAX_RETRIES = 2;
+
+/**
+ * Validate the model's turn before presenting it to the user. Returns the
+ * problems to feed back to the model, or [] if the turn is acceptable. Add
+ * rules here as needed; the retry loop is generic.
+ */
+function validateAssistantResult(result: IChatResult): string[] {
+  const errors: string[] = [];
+  if (result.toolCalls.length > 0 && result.text.trim() === '') {
+    errors.push(
+      'You proposed actions with no explanation. Tool calls are shown to the ' +
+        'user as approval requests, so first state in natural language what ' +
+        'you intend to do and why, then request the action(s) again.'
+    );
+  }
+  return errors;
+}
+
 type QueryActionType = (typeof QUERY_ACTION_TYPES)[number];
 type MutateActionType = 'insertCell' | 'updateCell' | 'deleteCell' | 'runCell';
 type ActionType = QueryActionType | MutateActionType;
@@ -992,6 +1090,8 @@ interface IChatViewProps {
     action: IAction
   ) => void;
   onActionReject: (msgIndex: number, actionIndex: number) => void;
+  onActionCancel: () => void;
+  actionProgress: string;
   onAcceptAll: (msgIndex: number) => void;
   onAcceptAllAlways: (msgIndex: number) => void;
   onRejectAll: (msgIndex: number) => void;
@@ -1022,6 +1122,8 @@ function ChatView({
   onActionApprove,
   onActionApproveAlways,
   onActionReject,
+  onActionCancel,
+  actionProgress,
   onAcceptAll,
   onAcceptAllAlways,
   onRejectAll,
@@ -1077,7 +1179,7 @@ function ChatView({
     <>
       <div className="jp-Mynerva-messages">
         {messages.map((msg, msgIndex) => {
-          const actions = msg.actions || [];
+          const actions = (msg.toolCalls || []).map(toolCallToAction);
           const pendingCount = actions.filter(
             (_, i) => getActionStatus(msgIndex, i) === 'pending'
           ).length;
@@ -1085,21 +1187,23 @@ function ChatView({
 
           return (
             <React.Fragment key={msgIndex}>
-              {/* Message */}
-              <div className={`jp-Mynerva-message jp-Mynerva-${msg.role}`}>
-                {msg.role === 'assistant' ? (
-                  <div
-                    className="jp-Mynerva-message-content jp-Mynerva-markdown"
-                    dangerouslySetInnerHTML={{
-                      __html: marked.parse(getDisplayContent(msg)) as string
-                    }}
-                  />
-                ) : (
-                  <div className="jp-Mynerva-message-content">
-                    {getDisplayContent(msg)}
-                  </div>
-                )}
-              </div>
+              {/* Message (skip empty bubbles, e.g. tool-only assistant turns) */}
+              {getDisplayContent(msg).trim() !== '' && (
+                <div className={`jp-Mynerva-message jp-Mynerva-${msg.role}`}>
+                  {msg.role === 'assistant' ? (
+                    <div
+                      className="jp-Mynerva-message-content jp-Mynerva-markdown"
+                      dangerouslySetInnerHTML={{
+                        __html: marked.parse(getDisplayContent(msg)) as string
+                      }}
+                    />
+                  ) : (
+                    <div className="jp-Mynerva-message-content">
+                      {getDisplayContent(msg)}
+                    </div>
+                  )}
+                </div>
+              )}
               {/* Actions with bulk header */}
               {actions.length > 0 && (
                 <div className="jp-Mynerva-actions-container">
@@ -1153,6 +1257,8 @@ function ChatView({
                             onReject={() =>
                               onActionReject(msgIndex, actionIndex)
                             }
+                            onCancel={onActionCancel}
+                            progress={actionProgress}
                           />
                         ) : null
                       )}
@@ -1180,6 +1286,8 @@ function ChatView({
                             onReject={() =>
                               onActionReject(msgIndex, actionIndex)
                             }
+                            onCancel={onActionCancel}
+                            progress={actionProgress}
                           />
                         ) : null
                       )}
@@ -1378,11 +1486,15 @@ function MynervaComponent({
     Map<number, Map<number, ActionStatus>>
   >(new Map());
 
-  // Queue of action results waiting to be sent
-  const [pendingResults, setPendingResults] = React.useState<string[]>([]);
+  // Queue of tool results waiting to be sent back to the LLM
+  const [pendingResults, setPendingResults] = React.useState<IToolResult[]>([]);
 
   // Flag to prevent duplicate execution from useEffect during batch operations
   const executingActionsRef = React.useRef(false);
+  // Aborts the action currently being executed (e.g. a slow nbsearch summary)
+  const actionAbortRef = React.useRef<AbortController | null>(null);
+  // Progress text for the action currently executing (shown on its card)
+  const [actionProgress, setActionProgress] = React.useState('');
 
   // Auto-save session when messages change
   React.useEffect(() => {
@@ -1408,7 +1520,7 @@ function MynervaComponent({
       // Mark all actions in loaded session as executed (already processed)
       const statuses = new Map<number, Map<number, ActionStatus>>();
       session.messages.forEach((msg, msgIndex) => {
-        const actions = msg.actions || [];
+        const actions = msg.toolCalls || [];
         if (actions.length > 0) {
           const actionMap = new Map<number, ActionStatus>();
           actions.forEach((_, actionIndex) => {
@@ -1445,7 +1557,11 @@ function MynervaComponent({
     }
   };
 
-  const executeQueryAction = async (action: IAction): Promise<string> => {
+  const executeQueryAction = async (
+    action: IAction,
+    signal?: AbortSignal,
+    onProgress?: (event: Record<string, unknown>) => void
+  ): Promise<string> => {
     let result: string;
     switch (action.type) {
       case 'getToc': {
@@ -1476,7 +1592,7 @@ function MynervaComponent({
         result = JSON.stringify(
           {
             type: 'listHelp',
-            result: buildSystemPrompt({ nbsearchAvailable })
+            result: buildSystemPrompt()
           },
           null,
           2
@@ -1552,7 +1668,9 @@ function MynervaComponent({
         const searchResult = await callNBSearch(
           'notebooks',
           action,
-          filterEnabled
+          filterEnabled,
+          signal,
+          onProgress
         );
         result = JSON.stringify(
           { type: 'searchNotebooks', result: searchResult },
@@ -1565,7 +1683,9 @@ function MynervaComponent({
         const searchResult = await callNBSearch(
           'summary-cells-from-search',
           action,
-          filterEnabled
+          filterEnabled,
+          signal,
+          onProgress
         );
         result = JSON.stringify(
           { type: 'summaryCellsFromSearch', result: searchResult },
@@ -1578,7 +1698,8 @@ function MynervaComponent({
         const searchResult = await callNBSearch(
           'cells-from-search',
           action,
-          filterEnabled
+          filterEnabled,
+          signal
         );
         result = JSON.stringify(
           { type: 'getCellsFromSearch', result: searchResult },
@@ -1641,7 +1762,7 @@ function MynervaComponent({
   };
 
   const hasPendingActions = messages.some((msg, msgIndex) =>
-    (msg.actions || []).some((_, actionIndex) => {
+    (msg.toolCalls || []).some((_, actionIndex) => {
       const status = getActionStatus(msgIndex, actionIndex);
       return status === 'pending' || status === 'approved';
     })
@@ -1670,31 +1791,60 @@ function MynervaComponent({
     setActionStatus(msgIndex, actionIndex, 'rejected');
   };
 
+  const handleActionCancel = () => {
+    actionAbortRef.current?.abort();
+  };
+
   const executeApprovedAction = async (
     msgIndex: number,
     actionIndex: number,
-    action: IAction
+    action: IAction,
+    toolCallId: string,
+    signal?: AbortSignal
   ) => {
-    let result: string;
+    let toolResult: IToolResult;
+    setActionProgress('');
     try {
-      if (isQueryAction(action)) {
-        result = await executeQueryAction(action);
-      } else {
-        result = await executeMutateAction(action);
-      }
+      const result = isQueryAction(action)
+        ? await executeQueryAction(action, signal, event =>
+            setActionProgress(formatActionProgress(event))
+          )
+        : await executeMutateAction(action);
+      toolResult = { id: toolCallId, result };
     } catch (e) {
+      // User-initiated cancellation: record it and stop, don't surface as error.
+      if (signal?.aborted || (e instanceof Error && e.name === 'AbortError')) {
+        setPendingResults(prev => [
+          ...prev,
+          {
+            id: toolCallId,
+            result: JSON.stringify(
+              { type: action.type, cancelled: true },
+              null,
+              2
+            ),
+            isError: true
+          }
+        ]);
+        setActionStatus(msgIndex, actionIndex, 'cancelled');
+        return;
+      }
       console.error('Action failed:', action.type, e);
-      result = JSON.stringify(
-        {
-          type: action.type,
-          error: e instanceof Error ? e.message : 'Unknown error'
-        },
-        null,
-        2
-      );
+      toolResult = {
+        id: toolCallId,
+        result: JSON.stringify(
+          {
+            type: action.type,
+            error: e instanceof Error ? e.message : 'Unknown error'
+          },
+          null,
+          2
+        ),
+        isError: true
+      };
     }
 
-    setPendingResults(prev => [...prev, result]);
+    setPendingResults(prev => [...prev, toolResult]);
     setActionStatus(msgIndex, actionIndex, 'executed');
   };
 
@@ -1803,10 +1953,9 @@ function MynervaComponent({
   };
 
   const handleAcceptAll = (msgIndex: number) => {
-    const msg = messages[msgIndex];
-    const actions = msg.actions || [];
+    const toolCalls = messages[msgIndex].toolCalls || [];
 
-    for (let i = 0; i < actions.length; i++) {
+    for (let i = 0; i < toolCalls.length; i++) {
       if (getActionStatus(msgIndex, i) !== 'pending') {
         continue;
       }
@@ -1815,10 +1964,9 @@ function MynervaComponent({
   };
 
   const handleRejectAll = (msgIndex: number) => {
-    const msg = messages[msgIndex];
-    const actions = msg.actions || [];
+    const toolCalls = messages[msgIndex].toolCalls || [];
 
-    for (let i = 0; i < actions.length; i++) {
+    for (let i = 0; i < toolCalls.length; i++) {
       if (getActionStatus(msgIndex, i) !== 'pending') {
         continue;
       }
@@ -1827,15 +1975,14 @@ function MynervaComponent({
   };
 
   const handleAcceptAllAlways = (msgIndex: number) => {
-    const msg = messages[msgIndex];
-    const actions = msg.actions || [];
+    const toolCalls = messages[msgIndex].toolCalls || [];
 
-    for (let i = 0; i < actions.length; i++) {
+    for (let i = 0; i < toolCalls.length; i++) {
       if (getActionStatus(msgIndex, i) !== 'pending') {
         continue;
       }
       handleActionApprove(msgIndex, i);
-      addAutoApproval(actions[i]);
+      addAutoApproval(toolCallToAction(toolCalls[i]));
     }
   };
 
@@ -1847,51 +1994,92 @@ function MynervaComponent({
 
     const executeBatch = async () => {
       executingActionsRef.current = true;
+      const controller = new AbortController();
+      actionAbortRef.current = controller;
       try {
         for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
-          const msg = messages[msgIndex];
-          const actions = msg.actions || [];
-          if (actions.length === 0) {
+          const toolCalls = messages[msgIndex].toolCalls || [];
+          if (toolCalls.length === 0) {
             continue;
           }
 
-          // Check if all actions are decided (not pending)
-          const allDecided = actions.every(
+          // Check if all tool calls are decided (not pending)
+          const allDecided = toolCalls.every(
             (_, i) => getActionStatus(msgIndex, i) !== 'pending'
           );
           if (!allDecided) {
             continue;
           }
 
-          // Check if any actions need processing
-          const hasApproved = actions.some(
+          // Check if any tool calls need processing
+          const hasApproved = toolCalls.some(
             (_, i) => getActionStatus(msgIndex, i) === 'approved'
           );
-          const hasRejected = actions.some(
+          const hasRejected = toolCalls.some(
             (_, i) => getActionStatus(msgIndex, i) === 'rejected'
           );
           if (!hasApproved && !hasRejected) {
             continue;
           }
 
-          // Process actions in order: execute approved, notify rejected
-          for (let i = 0; i < actions.length; i++) {
+          // Process in order: execute approved, notify rejected. Every tool
+          // call must get a result (provider pairing), so on cancellation the
+          // remaining ones are answered with a cancelled result too.
+          for (let i = 0; i < toolCalls.length; i++) {
+            if (controller.signal.aborted) {
+              for (let j = i; j < toolCalls.length; j++) {
+                const st = getActionStatus(msgIndex, j);
+                if (
+                  st === 'executed' ||
+                  st === 'notified' ||
+                  st === 'cancelled'
+                ) {
+                  continue;
+                }
+                setPendingResults(prev => [
+                  ...prev,
+                  {
+                    id: toolCalls[j].id,
+                    result: JSON.stringify(
+                      { type: toolCalls[j].name, cancelled: true },
+                      null,
+                      2
+                    ),
+                    isError: true
+                  }
+                ]);
+                setActionStatus(msgIndex, j, 'cancelled');
+              }
+              break;
+            }
             const status = getActionStatus(msgIndex, i);
             if (status === 'approved') {
-              await executeApprovedAction(msgIndex, i, actions[i]);
+              setActionStatus(msgIndex, i, 'executing');
+              await executeApprovedAction(
+                msgIndex,
+                i,
+                toolCallToAction(toolCalls[i]),
+                toolCalls[i].id,
+                controller.signal
+              );
             } else if (status === 'rejected') {
               const result = JSON.stringify(
-                { type: actions[i].type, rejected: true },
+                { type: toolCalls[i].name, rejected: true },
                 null,
                 2
               );
-              setPendingResults(prev => [...prev, result]);
+              setPendingResults(prev => [
+                ...prev,
+                { id: toolCalls[i].id, result }
+              ]);
               setActionStatus(msgIndex, i, 'notified');
             }
           }
         }
       } finally {
         executingActionsRef.current = false;
+        actionAbortRef.current = null;
+        setActionProgress('');
       }
     };
 
@@ -1908,33 +2096,18 @@ function MynervaComponent({
       setLoading(true);
       const results = pendingResults;
       setPendingResults([]);
-      const continuationHint = getSearchCellsContinuationHint(results);
 
       const feedbackMessage: IMessage = {
         role: 'user',
-        content: [`[Action Results]\n${results.join('\n\n')}`, continuationHint]
-          .filter(Boolean)
-          .join('\n\n'),
+        content: '[Tool results]',
+        toolResults: results,
         generated: true
       };
       const newMessages = [...messages, feedbackMessage];
       setMessages(newMessages);
 
-      const chatMessages = [
-        {
-          role: 'system' as const,
-          content: buildSystemPrompt({ nbsearchAvailable })
-        },
-        ...newMessages
-      ];
-
       try {
-        const response = await runChat(chatMessages);
-        const finalMessages = await processLLMResponse(
-          response,
-          newMessages,
-          0
-        );
+        const finalMessages = await runChatWithRetry(newMessages);
         setMessages(finalMessages);
       } catch (e) {
         const errorMessage: IMessage = {
@@ -1958,8 +2131,9 @@ function MynervaComponent({
     }
 
     for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
-      const msg = messages[msgIndex];
-      const actions = msg.actions || [];
+      const actions = (messages[msgIndex].toolCalls || []).map(
+        toolCallToAction
+      );
       if (actions.length === 0) {
         continue;
       }
@@ -2000,16 +2174,19 @@ function MynervaComponent({
   const runChat = async (
     chatMessages: IMessage[],
     signal?: AbortSignal
-  ): Promise<string> => {
+  ): Promise<IChatResult> => {
     clearStreamingState();
     try {
       return await sendChat(
         chatMessages,
+        getToolDefinitions({ nbsearchAvailable }),
         {
           onContentBlockStart: (ct: string) => setActiveContentType(ct),
           onContentBlockDelta: (ct: string, delta: string) => {
+            // Deltas are incremental tokens now (the backend streams raw text),
+            // so accumulate rather than replace.
             if (ct === 'text') {
-              setStreamingContent(delta);
+              setStreamingContent(prev => prev + delta);
             } else if (ct === 'thinking') {
               setThinkingContent(prev => prev + delta);
             }
@@ -2022,9 +2199,9 @@ function MynervaComponent({
               setThinkingContent(metadata.text as string);
             }
           },
-          onMessageDone: (_text: string, reason?: string) => {
-            if (reason) {
-              setStopReason(reason);
+          onMessageDone: (result: IChatResult) => {
+            if (result.stopReason) {
+              setStopReason(result.stopReason);
             }
           }
         },
@@ -2035,105 +2212,68 @@ function MynervaComponent({
     }
   };
 
-  const processLLMResponse = async (
-    rawContent: string,
-    currentMessages: IMessage[],
-    retryCount: number,
-    signal?: AbortSignal
-  ): Promise<IMessage[]> => {
-    const MAX_RETRIES = 2;
-    const parseResult = parseRawContent(rawContent);
+  const buildAssistantMessage = (result: IChatResult): IMessage => ({
+    role: 'assistant',
+    // Empty for tool-only turns (the bubble is hidden); only fall back to a
+    // placeholder when there is no text and no tool calls at all.
+    content: result.text || (result.toolCalls.length > 0 ? '' : '(no message)'),
+    toolCalls: result.toolCalls.length > 0 ? result.toolCalls : undefined,
+    assistantBlocks: result.assistantBlocks
+  });
 
-    // JSON parse error - retry with feedback
-    if (parseResult.warning) {
-      if (retryCount < MAX_RETRIES) {
-        const assistantMessage: IMessage = {
-          role: 'assistant',
-          content: '(Format error - retrying...)'
-        };
-        const feedbackMessage: IMessage = {
-          role: 'user',
-          content: `[Format Error]\n\nYour response was not valid JSON. You must respond with JSON only, no text before or after.\n\nError: ${parseResult.warning.message}\n\nPlease retry with correct JSON format.`,
-          generated: true
-        };
-        const newMessages = [
-          ...currentMessages,
-          assistantMessage,
-          feedbackMessage
-        ];
-        setMessages(newMessages);
-
-        const chatMessages = [
-          {
-            role: 'system' as const,
-            content: buildSystemPrompt({ nbsearchAvailable })
-          },
-          ...newMessages
-        ];
-
-        const nextResponse = await runChat(chatMessages, signal);
-        return processLLMResponse(
-          nextResponse,
-          newMessages,
-          retryCount + 1,
-          signal
-        );
-      }
-      // Max retries reached - show raw content
-      return [...currentMessages, { role: 'assistant', content: rawContent }];
-    }
-
-    const llmResponse = parseResult.response!;
-    const validation = validateActions(llmResponse.actions);
-
-    const assistantContent = llmResponse.messages
-      .map(m => m.content)
-      .filter(Boolean)
-      .join('\n\n');
-
-    // Action validation error - retry with feedback
-    if (!validation.valid && retryCount < MAX_RETRIES) {
-      const assistantMessage: IMessage = {
-        role: 'assistant',
-        content: assistantContent || '(Action format error - retrying...)'
-      };
-      const feedbackMessage: IMessage = {
+  // Feed validation errors back to the model. Tool calls must be answered with
+  // tool results (provider pairing), so the errors ride on those; otherwise a
+  // plain generated user message carries them.
+  const buildRetryFeedback = (
+    result: IChatResult,
+    errors: string[]
+  ): IMessage => {
+    const text = errors.join('\n');
+    if (result.toolCalls.length > 0) {
+      return {
         role: 'user',
-        content: validation.feedbackMessage!,
+        content: '[Retry requested]',
+        toolResults: result.toolCalls.map(tc => ({
+          id: tc.id,
+          result: text,
+          isError: true
+        })),
         generated: true
       };
-      const newMessages = [
-        ...currentMessages,
-        assistantMessage,
-        feedbackMessage
-      ];
-      setMessages(newMessages);
-
-      const chatMessages = [
-        {
-          role: 'system' as const,
-          content: buildSystemPrompt({ nbsearchAvailable })
-        },
-        ...newMessages
-      ];
-
-      const nextResponse = await runChat(chatMessages, signal);
-      return processLLMResponse(
-        nextResponse,
-        newMessages,
-        retryCount + 1,
-        signal
-      );
     }
+    return { role: 'user', content: text, generated: true };
+  };
 
-    // Validation passed - include actions
-    const assistantMessage: IMessage = {
-      role: 'assistant',
-      content: assistantContent || '(no message)',
-      actions: llmResponse.actions as IAction[]
-    };
+  // Run one chat turn, feeding validation errors back to the model and retrying
+  // (bounded) until the turn is acceptable. Returns the message list to commit:
+  // only the final accepted assistant turn, not the intermediate correction
+  // round-trips (which are sent to the provider in-loop but never committed, so
+  // the approval machinery never sees a rejected turn's tool calls). The loop
+  // runs while `loading` is true, so the approval effects stay dormant.
+  const runChatWithRetry = async (
+    history: IMessage[],
+    signal?: AbortSignal
+  ): Promise<IMessage[]> => {
+    const withSystem = (msgs: IMessage[]): IMessage[] => [
+      { role: 'system', content: buildSystemPrompt() },
+      ...msgs
+    ];
 
-    return [...currentMessages, assistantMessage];
+    let apiMessages = history;
+    let result = await runChat(withSystem(apiMessages), signal);
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const errors = validateAssistantResult(result);
+      if (errors.length === 0) {
+        break;
+      }
+      apiMessages = [
+        ...apiMessages,
+        buildAssistantMessage(result),
+        buildRetryFeedback(result, errors)
+      ];
+      result = await runChat(withSystem(apiMessages), signal);
+    }
+    return [...history, buildAssistantMessage(result)];
   };
 
   const handleCancelLoading = () => {
@@ -2170,19 +2310,8 @@ function MynervaComponent({
     }
 
     try {
-      const chatMessages = [
-        {
-          role: 'system' as const,
-          content: buildSystemPrompt({ nbsearchAvailable })
-        },
-        ...newMessages
-      ];
-
-      const response = await runChat(chatMessages, controller.signal);
-      const finalMessages = await processLLMResponse(
-        response,
+      const finalMessages = await runChatWithRetry(
         newMessages,
-        0,
         controller.signal
       );
       setMessages(finalMessages);
@@ -2341,6 +2470,8 @@ function MynervaComponent({
           onActionApprove={handleActionApprove}
           onActionApproveAlways={handleActionApproveAlways}
           onActionReject={handleActionReject}
+          onActionCancel={handleActionCancel}
+          actionProgress={actionProgress}
           onAcceptAll={handleAcceptAll}
           onAcceptAllAlways={handleAcceptAllAlways}
           onRejectAll={handleRejectAll}

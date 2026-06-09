@@ -54,10 +54,62 @@ _NBSEARCH_SORTS = {
 
 _NBSEARCH_REFERENCE_CACHE = cachetools.TTLCache(maxsize=512, ttl=3600)
 _NBSEARCH_REFERENCE_CELL_COUNT = 10000
-_NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES = 100 * 1024
 _NBSEARCH_CELLS_PAGE_LIMIT_BYTES = 100 * 1024
 _NBSEARCH_CELLS_MAX_LIMIT = 50
-_NBSEARCH_CELL_SUMMARY_LIMIT_BYTES = 100 * 1024
+
+# When a summarization request overflows the model's context window (common
+# with small-context local models), the input is split and summarized
+# recursively (map-reduce). The depth is bounded so a pathologically small
+# context cannot recurse forever; at the floor the content is truncated.
+_NBSEARCH_SUMMARY_MAX_DEPTH = 4
+_NBSEARCH_SUMMARY_FLOOR_CHARS = 2000
+
+# System prompts for the two summary flavors (searchNotebooks relevance line vs
+# summaryCellsFromSearch content paragraph). Both cite cell indexes/ranges.
+_NBSEARCH_RESULT_INSTRUCTION = (
+    'Summarize why this notebook is relevant to the user focus. '
+    'Use only the provided cells, shared according to the user-approved Privacy filter setting. '
+    'Include the supporting cell index or range in the sentence, '
+    'such as "セル12-14では...". '
+    'Return one concise Japanese sentence.'
+)
+_NBSEARCH_CELLS_INSTRUCTION = (
+    'Summarize the provided notebook cells for the user focus. '
+    'The cells are shared according to the user-approved Privacy filter setting. '
+    'The summary is used to decide which raw cells to read next. '
+    'Always include relevant cell indexes or ranges in the summary. '
+    'Use the format "セル12" for one cell and "セル12-18" for a range. '
+    'Do not return raw cell contents. '
+    'Return one concise Japanese paragraph.'
+)
+
+# Substrings identifying a "prompt exceeds context window" error across
+# providers and local OpenAI-compatible servers. Matching is best-effort: a
+# miss re-raises (same behavior as before) and a false match only triggers a
+# needless but still-correct map-reduce pass.
+_CONTEXT_EXCEEDED_MARKERS = (
+    'exceed_context_size_error',
+    'exceeds the available context size',
+    'context_length_exceeded',
+    'maximum context length',
+    'context window',
+)
+
+
+def _is_context_exceeded(exc):
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONTEXT_EXCEEDED_MARKERS)
+
+
+def _truncate_for_floor(value, limit=_NBSEARCH_SUMMARY_FLOOR_CHARS):
+    """Recursively clip string values so a floor-level retry can fit."""
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, dict):
+        return {k: _truncate_for_floor(v, limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_truncate_for_floor(v, limit) for v in value]
+    return value
 
 
 def _solr_phrase(value):
@@ -165,56 +217,14 @@ def _source_only_cell(cell):
     return result
 
 
-def _source_only_cells_result(cells_result):
-    if not isinstance(cells_result, dict):
-        return cells_result
-    result = {}
-    if 'error' in cells_result:
-        result['error'] = cells_result['error']
-    if 'cells' in cells_result:
-        result['cells'] = [_source_only_cell(cell) for cell in cells_result['cells']]
-    return result
+def _source_only_cells(cells_result):
+    """Flatten an nblibram cells_result into a source-only cell list.
 
-
-def _prepare_summary_cells(cells):
-    if _estimate_json_size(cells, _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES) <= _NBSEARCH_SUMMARY_FULL_CELLS_LIMIT_BYTES:
-        return cells
-    summary_cells = []
-    for item in cells:
-        if not isinstance(item, dict):
-            summary_cells.append(item)
-            continue
-        summary_item = {}
-        if 'referenceId' in item:
-            summary_item['referenceId'] = item['referenceId']
-        if 'cells' in item:
-            summary_item['cells'] = _source_only_cells_result(item['cells'])
-        summary_cells.append(summary_item)
-    return summary_cells
-
-
-def _prepare_cells_summary_input(cells_result, budget=_NBSEARCH_CELL_SUMMARY_LIMIT_BYTES):
-    if not isinstance(cells_result, dict):
-        return cells_result, 'unknown'
-    cells = cells_result.get('cells')
-    if not isinstance(cells, list):
-        return cells_result, 'unknown'
-
-    total = len(cells)
-    if _estimate_json_size(cells, budget) <= budget:
-        return cells, f'full {total}/{total} cells'
-
-    source_cells = [_source_only_cell(cell) for cell in cells]
-    if _estimate_json_size(source_cells, budget) <= budget:
-        return source_cells, f'full {total}/{total} cells'
-
-    selected = []
-    for cell in source_cells:
-        candidate = selected + [cell]
-        if selected and _estimate_json_size(candidate, budget) > budget:
-            break
-        selected = candidate
-    return selected, f'sampled {len(selected)}/{total} cells'
+    Outputs are dropped (summaries judge relevance from source, and outputs
+    bloat the context). The list is the unit map-reduce splits to fit the model
+    context, so each cell keeps its `_index` for citing ranges.
+    """
+    return [_source_only_cell(cell) for cell in cells_result['cells']]
 
 
 def _parse_non_negative_int(value, name, default=0):
@@ -271,17 +281,56 @@ def _paginate_cells_result(cells_result, start=0, limit=None, budget=_NBSEARCH_C
     return result
 
 
+# Targets whose work calls the LLM and can run for minutes (map-reduce). These
+# stream SSE so a reverse proxy's idle timeout never fires and the UI can show
+# progress; the cheap, LLM-free target stays a plain JSON request.
+_NBSEARCH_STREAMING_TARGETS = ('notebooks', 'summary-cells-from-search')
+_NBSEARCH_HEARTBEAT_INTERVAL = 15
+
+
 class NBSearchHandler(APIHandler):
+    # Per-request progress sink, set only while streaming (see _post_streaming).
+    _on_progress = None
+
+    def on_connection_close(self):
+        """Cancel in-flight work when the client disconnects (e.g. user abort).
+
+        Summarization can fan out into many LLM calls (map-reduce over a large
+        notebook); cancelling stops that work instead of running it to waste.
+        """
+        super().on_connection_close()
+        task = getattr(self, '_work_task', None)
+        if task is not None and not task.done():
+            self.log.info('nbsearch client disconnected; cancelling in-flight work')
+            task.cancel()
+
+    def _emit_progress(self, event):
+        """Report progress to the SSE stream, if one is active."""
+        if self._on_progress is not None:
+            self._on_progress(event)
+
+    async def _run_target(self, target, data):
+        if target == 'cells-from-search':
+            return await self._get_cells_from_search(data)
+        if target == 'summary-cells-from-search':
+            return await self._summary_cells_from_search(data)
+        return await self._search_notebooks(target, data)
+
     @tornado.web.authenticated
     async def post(self, target):
         data = self.get_json_body()
+        self._work_task = asyncio.current_task()
+        if target in _NBSEARCH_STREAMING_TARGETS:
+            await self._post_streaming(target, data)
+        else:
+            await self._post_json(target, data)
+
+    async def _post_json(self, target, data):
         try:
-            if target == 'cells-from-search':
-                result = await self._get_cells_from_search(data)
-            elif target == 'summary-cells-from-search':
-                result = await self._summary_cells_from_search(data)
-            else:
-                result = await self._search_notebooks(target, data)
+            result = await self._run_target(target, data)
+        except asyncio.CancelledError:
+            self.log.info('nbsearch request cancelled by client: target=%s', target)
+            raise
         except tornado.web.HTTPError as e:
             self.set_status(e.status_code)
             self.finish(json.dumps({'error': e.reason or e.log_message}))
@@ -292,6 +341,51 @@ class NBSearchHandler(APIHandler):
             self.finish(json.dumps({'error': 'nbsearch request failed; see server logs'}))
             return
         self.finish(json.dumps(result))
+
+    async def _post_streaming(self, target, data):
+        from jupyter_mynerva import routes
+
+        routes._init_sse(self)
+        self._on_progress = lambda event: routes._send_sse(
+            self, {'type': 'progress', **event})
+        heartbeat = asyncio.ensure_future(self._sse_heartbeat())
+        try:
+            result = await self._run_target(target, data)
+            routes._send_sse(self, {'type': 'done', 'result': result})
+        except asyncio.CancelledError:
+            self.log.info('nbsearch request cancelled by client: target=%s', target)
+            raise
+        except tornado.web.HTTPError as e:
+            routes._send_sse(self, {'type': 'error', 'error': e.reason or e.log_message})
+        except Exception:
+            self.log.exception('Unhandled nbsearch request failure: target=%s', target)
+            routes._send_sse(
+                self, {'type': 'error', 'error': 'nbsearch request failed; see server logs'})
+        finally:
+            heartbeat.cancel()
+            self._on_progress = None
+            try:
+                routes._finish_sse(self)
+            except Exception:
+                # Connection already closed (e.g. client aborted); nothing to flush.
+                pass
+
+    async def _sse_heartbeat(self):
+        """Emit SSE comments so an idle reverse proxy never times out the stream.
+
+        A single LLM call can exceed a proxy's read timeout on its own, so the
+        heartbeat runs on its own timer rather than only between work steps.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_NBSEARCH_HEARTBEAT_INTERVAL)
+                self.write(': keepalive\n\n')
+                self.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Stream closed; stop heartbeating.
+            return
 
     def _handler_config(self):
         config = getattr(self, 'config', None)
@@ -386,8 +480,14 @@ class NBSearchHandler(APIHandler):
         docs = response_body['docs']
         num_found = response_body.get('numFound', len(docs))
         search_id = f"search-{uuid.uuid4().hex}"
-        shaped_docs = [
-            await self._shape_notebook_result(
+        shaped_docs = []
+        for index, doc in enumerate(docs):
+            self._emit_progress({
+                'phase': 'notebook',
+                'current': index + 1,
+                'total': len(docs),
+            })
+            shaped_docs.append(await self._shape_notebook_result(
                 db,
                 search_id,
                 index,
@@ -395,9 +495,7 @@ class NBSearchHandler(APIHandler):
                 data['query'],
                 data['focus'],
                 bool(data.get('noFilter')),
-            )
-            for index, doc in enumerate(docs)
-        ]
+            ))
         return {
             'target': target,
             'searchId': search_id,
@@ -450,8 +548,10 @@ class NBSearchHandler(APIHandler):
             reference,
             bool(data.get('noFilter')),
         )
-        summary_input, coverage = _prepare_cells_summary_input(cells)
-        cell_count = len(cells.get('cells', [])) if isinstance(cells, dict) and isinstance(cells.get('cells'), list) else 0
+        cell_count = len(cells['cells'])
+        # map-reduce covers every cell, so all cells are in scope.
+        coverage = f'full {cell_count}/{cell_count} cells'
+        self._emit_progress({'phase': 'summarize', 'detail': 'summarizing cells'})
         return {
             'type': 'summaryCellsFromSearch',
             'referenceId': reference_id,
@@ -461,7 +561,7 @@ class NBSearchHandler(APIHandler):
             'summary': await self._summarize_search_cells(
                 data['focus'],
                 reference['filename'],
-                summary_input,
+                cells,
                 coverage,
             ),
             'readAction': {
@@ -543,159 +643,135 @@ class NBSearchHandler(APIHandler):
         finally:
             os.unlink(notebook_path)
 
-    async def _summarize_result(self, focus, filename, cells):
+    async def _run_summary(self, provider, model, api_key, base_url, config, messages):
+        """Send one summarization request and return the text.
+
+        Exceptions propagate unchanged so the adaptive caller can detect a
+        context-window overflow and fall back to map-reduce.
+        """
         from jupyter_mynerva import routes
 
-        config = await routes.load_config()
-        provider, model, api_key, base_url = await routes.resolve_chat_config(config)
-        cells = _prepare_summary_cells(cells)
-        messages = [
-            {
-                'role': 'system',
-                'content': (
-                    'Summarize why this notebook is relevant to the user focus. '
-                    'Use only the provided cells, shared according to the user-approved Privacy filter setting. '
-                    'Include the supporting cell index or range in the sentence, '
-                    'such as "セル12-14では...". '
-                    'Return one concise Japanese sentence.'
-                ),
-            },
-            {
-                'role': 'user',
-                'content': json.dumps({
-                    'focus': focus,
-                    'filename': filename,
-                    'cells': cells,
-                }, ensure_ascii=False),
-            },
-        ]
         if provider == 'openai':
             kwargs = {'api_key': api_key or ''}
             if base_url:
                 kwargs['base_url'] = base_url
             client = routes.AsyncOpenAI(**kwargs)
-            try:
-                response = await client.responses.create(model=model, input=messages)
-            except Exception:
-                self.log.exception(
-                    'Failed to summarize nbsearch result: provider=%s model=%s filename=%s',
-                    provider,
-                    model,
-                    filename,
-                )
-                raise
+            response = await client.responses.create(model=model, input=messages)
             return response.output_text.strip()
         if provider == 'enki-gate':
             enki_token = config.get('enkiGateToken')
             enki_url = config.get('enkiGateUrl')
             enki_model = config.get('enkiGateModel', '')
-            client = routes.AsyncOpenAI(api_key=enki_token, base_url=enki_url.rstrip('/') + '/v1')
-            try:
-                response = await client.responses.create(model=enki_model, input=messages)
-            except Exception:
-                self.log.exception(
-                    'Failed to summarize nbsearch result: provider=%s model=%s filename=%s',
-                    provider,
-                    enki_model,
-                    filename,
-                )
-                raise
+            client = routes.AsyncOpenAI(
+                api_key=enki_token, base_url=enki_url.rstrip('/') + '/v1'
+            )
+            response = await client.responses.create(model=enki_model, input=messages)
             return response.output_text.strip()
         if provider == 'anthropic':
             client = routes.AsyncAnthropic(api_key=api_key)
             kwargs = routes._build_anthropic_params(messages)
-            try:
-                response = await client.messages.create(model=model, **kwargs)
-            except Exception:
-                self.log.exception(
-                    'Failed to summarize nbsearch result: provider=%s model=%s filename=%s',
-                    provider,
-                    model,
-                    filename,
-                )
-                raise
-            return ''.join(block.text for block in response.content if block.type == 'text').strip()
-        if provider == 'echo':
-            return f'{filename} は検索 focus に関連する notebook です。関連箇所は提示されたセル番号を確認してください。'
+            response = await client.messages.create(model=model, **kwargs)
+            return ''.join(
+                block.text for block in response.content if block.type == 'text'
+            ).strip()
         raise tornado.web.HTTPError(400, reason=f'Unknown provider: {provider}')
 
-    async def _summarize_search_cells(self, focus, filename, cells, coverage):
+    async def _summarize_adaptive(
+        self, provider, model, api_key, base_url, config, build_messages,
+        segments, depth=0
+    ):
+        """Summarize `segments`, recursively splitting on context overflow.
+
+        Normal-size inputs take a single request. Only when the model reports a
+        context-window overflow do we split the segments in half, summarize each
+        half, then summarize the two partial summaries (map-reduce). Recursion
+        is bounded by `_NBSEARCH_SUMMARY_MAX_DEPTH`; at the floor the content is
+        truncated for one final attempt. Non-overflow errors propagate.
+        """
+        try:
+            return await self._run_summary(
+                provider, model, api_key, base_url, config,
+                build_messages(segments)
+            )
+        except Exception as exc:
+            if not _is_context_exceeded(exc):
+                raise
+            if len(segments) <= 1 or depth >= _NBSEARCH_SUMMARY_MAX_DEPTH:
+                self.log.warning(
+                    'nbsearch summary context overflow at floor '
+                    '(segments=%d, depth=%d); truncating input',
+                    len(segments), depth,
+                )
+                return await self._run_summary(
+                    provider, model, api_key, base_url, config,
+                    build_messages(_truncate_for_floor(segments))
+                )
+            self.log.info(
+                'nbsearch summary context overflow; splitting %d segments '
+                '(depth=%d)', len(segments), depth,
+            )
+            self._emit_progress({
+                'phase': 'summarize',
+                'detail': f'large notebook; summarizing in parts (depth {depth + 1})',
+            })
+            mid = len(segments) // 2
+            partials = []
+            for chunk in (segments[:mid], segments[mid:]):
+                partials.append(await self._summarize_adaptive(
+                    provider, model, api_key, base_url, config, build_messages,
+                    chunk, depth + 1,
+                ))
+            return await self._summarize_adaptive(
+                provider, model, api_key, base_url, config, build_messages,
+                partials, depth + 1,
+            )
+
+    async def _summarize(self, focus, filename, cells_result, instruction,
+                         echo_text, extra=None):
+        """Summarize a notebook's cells for `focus`, fitting the model context.
+
+        Cells are reduced to source-only and summarized via map-reduce
+        (`_summarize_adaptive`), which splits the cell list to fit any context
+        window. `instruction` is the system prompt; `extra` adds fields to the
+        user payload (e.g. coverage).
+        """
         from jupyter_mynerva import routes
 
         config = await routes.load_config()
         provider, model, api_key, base_url = await routes.resolve_chat_config(config)
-        messages = [
-            {
-                'role': 'system',
-                'content': (
-                    'Summarize the provided notebook cells for the user focus. '
-                    'The cells are shared according to the user-approved Privacy filter setting. '
-                    'The summary is used to decide which raw cells to read next. '
-                    'Always include relevant cell indexes or ranges in the summary. '
-                    'Use the format "セル12" for one cell and "セル12-18" for a range. '
-                    'Do not return raw cell contents. '
-                    'Return one concise Japanese paragraph.'
-                ),
-            },
-            {
-                'role': 'user',
-                'content': json.dumps({
-                    'focus': focus,
-                    'filename': filename,
-                    'coverage': coverage,
-                    'cells': cells,
-                }, ensure_ascii=False),
-            },
-        ]
-        if provider == 'openai':
-            kwargs = {'api_key': api_key or ''}
-            if base_url:
-                kwargs['base_url'] = base_url
-            client = routes.AsyncOpenAI(**kwargs)
-            try:
-                response = await client.responses.create(model=model, input=messages)
-            except Exception:
-                self.log.exception(
-                    'Failed to summarize nbsearch cells: provider=%s model=%s filename=%s',
-                    provider,
-                    model,
-                    filename,
-                )
-                raise
-            return response.output_text.strip()
-        if provider == 'enki-gate':
-            enki_token = config.get('enkiGateToken')
-            enki_url = config.get('enkiGateUrl')
-            enki_model = config.get('enkiGateModel', '')
-            client = routes.AsyncOpenAI(api_key=enki_token, base_url=enki_url.rstrip('/') + '/v1')
-            try:
-                response = await client.responses.create(model=enki_model, input=messages)
-            except Exception:
-                self.log.exception(
-                    'Failed to summarize nbsearch cells: provider=%s model=%s filename=%s',
-                    provider,
-                    enki_model,
-                    filename,
-                )
-                raise
-            return response.output_text.strip()
-        if provider == 'anthropic':
-            client = routes.AsyncAnthropic(api_key=api_key)
-            kwargs = routes._build_anthropic_params(messages)
-            try:
-                response = await client.messages.create(model=model, **kwargs)
-            except Exception:
-                self.log.exception(
-                    'Failed to summarize nbsearch cells: provider=%s model=%s filename=%s',
-                    provider,
-                    model,
-                    filename,
-                )
-                raise
-            return ''.join(block.text for block in response.content if block.type == 'text').strip()
         if provider == 'echo':
-            return f'{filename} は focus に関連するセル範囲を含みます。要約内のセル番号を使って getCellsFromSearch で詳細を確認してください。'
-        raise tornado.web.HTTPError(400, reason=f'Unknown provider: {provider}')
+            return echo_text
+        cells = _source_only_cells(cells_result)
+
+        def build_messages(segments):
+            payload = {'focus': focus, 'filename': filename}
+            if extra:
+                payload.update(extra)
+            payload['cells'] = segments
+            return [
+                {'role': 'system', 'content': instruction},
+                {'role': 'user',
+                 'content': json.dumps(payload, ensure_ascii=False)},
+            ]
+
+        return await self._summarize_adaptive(
+            provider, model, api_key, base_url, config, build_messages, cells
+        )
+
+    async def _summarize_result(self, focus, filename, cells_result):
+        return await self._summarize(
+            focus, filename, cells_result, _NBSEARCH_RESULT_INSTRUCTION,
+            f'{filename} は検索 focus に関連する notebook です。'
+            '関連箇所は提示されたセル番号を確認してください。',
+        )
+
+    async def _summarize_search_cells(self, focus, filename, cells_result, coverage):
+        return await self._summarize(
+            focus, filename, cells_result, _NBSEARCH_CELLS_INSTRUCTION,
+            f'{filename} は focus に関連するセル範囲を含みます。'
+            '要約内のセル番号を使って getCellsFromSearch で詳細を確認してください。',
+            extra={'coverage': coverage},
+        )
 
     def _shape_notebook_metadata(self, doc):
         return {
@@ -719,10 +795,7 @@ class NBSearchHandler(APIHandler):
             'summary': await self._summarize_result(
                 focus,
                 doc['filename'],
-                [{
-                    'referenceId': reference_id,
-                    'cells': cells,
-                }],
+                cells,
             ),
             'references': references,
         }

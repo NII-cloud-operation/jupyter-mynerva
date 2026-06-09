@@ -8,6 +8,8 @@ interface IQueryActionCardProps {
   onApprove: () => void;
   onApproveAlways: () => void;
   onReject: () => void;
+  onCancel?: () => void;
+  progress?: string;
 }
 
 function getActionLabel(action: IQueryAction): string {
@@ -66,11 +68,14 @@ export function QueryActionCard({
   status,
   onApprove,
   onApproveAlways,
-  onReject
+  onReject,
+  onCancel,
+  progress
 }: IQueryActionCardProps): React.ReactElement {
   const label = getActionLabel(action);
 
-  const isCompleted = status === 'executed' || status === 'notified';
+  const isCompleted =
+    status === 'executed' || status === 'notified' || status === 'cancelled';
 
   return (
     <div
@@ -102,9 +107,29 @@ export function QueryActionCard({
           Approved
         </div>
       )}
+      {status === 'executing' && (
+        <div className="jp-Mynerva-action-executing">
+          <span className="jp-Mynerva-action-badge jp-Mynerva-executing-badge">
+            {progress ? `Running… (${progress})` : 'Running…'}
+          </span>
+          {onCancel && (
+            <button
+              className="jp-Mynerva-action-button jp-Mynerva-dismiss-button"
+              onClick={onCancel}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
       {status === 'executed' && (
         <div className="jp-Mynerva-action-badge jp-Mynerva-shared-badge">
           Shared
+        </div>
+      )}
+      {status === 'cancelled' && (
+        <div className="jp-Mynerva-action-badge jp-Mynerva-dismissed-badge">
+          Cancelled
         </div>
       )}
       {(status === 'rejected' || status === 'notified') && (

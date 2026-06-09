@@ -640,61 +640,69 @@ def sse_serializer(func):
     return wrapper
 
 
-def _convert_messages_for_responses_api(messages):
-    """Convert Chat Completions messages to Responses API input format.
+def _build_openai_tools(tools):
+    """Wrap provider-neutral tool defs into the Responses API function shape."""
+    return [
+        {
+            'type': 'function',
+            'name': t['name'],
+            'description': t['description'],
+            'parameters': t['parameters'],
+        }
+        for t in tools
+    ]
 
-    The Responses API uses 'developer' role instead of 'system'.
+
+def _build_openai_input(messages):
+    """Build the Responses API `input` array from the message history.
+
+    System -> developer message. Assistant turns carry their native output
+    items verbatim (`assistantBlocks`) so reasoning/function_call items round
+    trip unchanged. Tool results become `function_call_output` items.
     """
     result = []
     for m in messages:
         role = m.get('role', 'user')
         if role == 'system':
-            role = 'developer'
-        result.append({'role': role, 'content': m.get('content', '')})
+            result.append({'role': 'developer', 'content': m.get('content', '')})
+        elif role == 'assistant':
+            blocks = m.get('assistantBlocks')
+            if blocks:
+                result.extend(blocks)
+            else:
+                result.append({'role': 'assistant', 'content': m.get('content', '')})
+        else:
+            tool_results = m.get('toolResults')
+            if tool_results:
+                for r in tool_results:
+                    result.append({
+                        'type': 'function_call_output',
+                        'call_id': r['id'],
+                        'output': r['result'],
+                    })
+            else:
+                result.append({'role': 'user', 'content': m.get('content', '')})
     return result
 
 
-def _extract_json_content(raw):
-    """Extract the 'content' field value from a partial JSON string.
-
-    The LLM responds with JSON like {"messages":[{"role":"assistant","content":"TEXT"}],...}.
-    This extracts TEXT for display during streaming, handling escape sequences.
-    Returns empty string if content field is not yet found.
-    """
-    match = re.search(r'"content"\s*:\s*"', raw)
-    if not match:
-        return ''
-    start = match.end()
-    result = []
-    i = start
-    while i < len(raw):
-        c = raw[i]
-        if c == '\\' and i + 1 < len(raw):
-            nxt = raw[i + 1]
-            result.append({'n': '\n', 't': '\t', '"': '"', '\\': '\\'}.get(nxt, nxt))
-            i += 2
-        elif c == '"':
-            break
-        else:
-            result.append(c)
-            i += 1
-    return ''.join(result)
-
-
 @sse_serializer
-async def chat_openai(handler, api_key, model, messages, base_url=None):
+async def chat_openai(handler, api_key, model, messages, tools=None, base_url=None):
     """Serializer for OpenAI Responses API (used also for Enki Gate)."""
     kwargs = {'api_key': api_key or ''}
     if base_url:
         kwargs['base_url'] = base_url
     client = AsyncOpenAI(**kwargs)
 
-    api_input = _convert_messages_for_responses_api(messages)
-    text_accumulated = ''
+    create_kwargs = {
+        'model': model,
+        'input': _build_openai_input(messages),
+        'stream': True,
+    }
+    if tools:
+        create_kwargs['tools'] = _build_openai_tools(tools)
 
-    stream = await client.responses.create(
-        model=model, input=api_input, stream=True
-    )
+    text_accumulated = ''
+    stream = await client.responses.create(**create_kwargs)
     async for event in stream:
         if event.type == 'response.in_progress':
             _block_start(handler, 'thinking')
@@ -711,71 +719,115 @@ async def chat_openai(handler, api_key, model, messages, base_url=None):
 
         elif event.type == 'response.output_text.delta':
             text_accumulated += event.delta
-            display = _extract_json_content(text_accumulated)
-            if display:
-                _block_delta(handler, 'text', display)
+            _block_delta(handler, 'text', event.delta)
 
         elif event.type == 'response.output_text.done':
             _block_stop(handler, 'text')
 
         elif event.type == 'response.completed':
             resp = event.response
-            stop_reason = getattr(resp, 'status', 'completed')
-            incomplete = getattr(resp, 'incomplete_details', None)
-            if incomplete:
-                stop_reason = str(getattr(incomplete, 'reason', stop_reason))
+            output = resp.output or []
+            assistant_blocks = [
+                o.model_dump(mode='json', exclude_none=True) for o in output
+            ]
+            tool_calls = [
+                {'id': o.call_id, 'name': o.name,
+                 'input': json.loads(o.arguments or '{}')}
+                for o in output if o.type == 'function_call'
+            ]
+            if tool_calls:
+                stop_reason = 'tool_use'
+            else:
+                stop_reason = getattr(resp, 'status', 'completed')
+                incomplete = getattr(resp, 'incomplete_details', None)
+                if incomplete:
+                    stop_reason = str(getattr(incomplete, 'reason', stop_reason))
             _send_sse(handler, {'type': 'message_done',
                                 'text': text_accumulated,
-                                'stop_reason': stop_reason})
+                                'stop_reason': stop_reason,
+                                'tool_calls': tool_calls,
+                                'assistant_blocks': assistant_blocks})
 
         elif event.type == 'response.failed':
             error_msg = str(getattr(event, 'error', 'Unknown error'))
             _send_sse(handler, {'type': 'error', 'error': error_msg})
 
 
-def _build_anthropic_params(messages):
+def _anthropic_thinking_config(model):
+    """Choose the thinking config by model version.
+
+    Adaptive thinking is supported from Claude 4.6 onward, where the older
+    `budget_tokens` form is removed (it 400s on Opus 4.7/4.8). Earlier models
+    use `budget_tokens`.
+    """
+    m = re.search(r'(\d+)-(\d+)', model)
+    if m and (int(m.group(1)), int(m.group(2))) >= (4, 6):
+        return {'type': 'adaptive'}
+    return {'type': 'enabled', 'budget_tokens': 2000}
+
+
+def _build_anthropic_params(messages, tools=None, model=''):
     """Build Anthropic API parameters from message list.
 
-    Extracts system messages into a separate system param and appends
-    action data to message content.
+    System messages fold into the `system` param. Assistant turns carry their
+    native content blocks verbatim (`assistantBlocks`) so thinking signatures
+    round trip. Tool results become `tool_result` blocks.
     """
     api_messages = []
     system_text = None
     for m in messages:
         role = m.get('role')
-        content = m.get('content', '')
-        actions = m.get('actions')
-        if actions:
-            content += '\n\n[Actions proposed]\n' + json.dumps(actions)
-
         if role == 'system':
+            content = m.get('content', '')
             if system_text is None:
                 system_text = content
             else:
                 system_text += '\n\n' + content
+        elif role == 'assistant':
+            blocks = m.get('assistantBlocks')
+            if blocks:
+                api_messages.append({'role': 'assistant', 'content': blocks})
+            else:
+                api_messages.append({'role': 'assistant',
+                                     'content': m.get('content', '')})
         else:
-            api_messages.append({'role': role, 'content': content})
+            tool_results = m.get('toolResults')
+            if tool_results:
+                content = [
+                    {'type': 'tool_result', 'tool_use_id': r['id'],
+                     'content': r['result'],
+                     **({'is_error': True} if r.get('isError') else {})}
+                    for r in tool_results
+                ]
+                api_messages.append({'role': 'user', 'content': content})
+            else:
+                api_messages.append({'role': 'user',
+                                     'content': m.get('content', '')})
 
     kwargs = {
         'max_tokens': 32000,
         'messages': api_messages,
-        'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+        'thinking': _anthropic_thinking_config(model)
     }
+    if tools:
+        kwargs['tools'] = [
+            {'name': t['name'], 'description': t['description'],
+             'input_schema': t['parameters']}
+            for t in tools
+        ]
     if system_text:
         kwargs['system'] = system_text
     return kwargs
 
 
 @sse_serializer
-async def chat_anthropic(handler, api_key, model, messages):
+async def chat_anthropic(handler, api_key, model, messages, tools=None):
     """Serializer for Anthropic messages.stream API."""
     client = AsyncAnthropic(api_key=api_key)
-    kwargs = _build_anthropic_params(messages)
+    kwargs = _build_anthropic_params(messages, tools, model)
 
-    text_accumulated = ''
     async with client.messages.stream(model=model, **kwargs) as stream:
-        # Anthropic の content_block.type は Mynerva の content_type と一致する
-        # サポート対象: 'thinking', 'text'
+        # content_block.type matches Mynerva's content_type for thinking/text
         current_block_type = ''
         async for event in stream:
             if event.type == 'content_block_start':
@@ -789,10 +841,7 @@ async def chat_anthropic(handler, api_key, model, messages):
                 if delta.type == 'thinking_delta':
                     _block_delta(handler, 'thinking', delta.thinking)
                 elif delta.type == 'text_delta':
-                    text_accumulated += delta.text
-                    display = _extract_json_content(text_accumulated)
-                    if display:
-                        _block_delta(handler, 'text', display)
+                    _block_delta(handler, 'text', delta.text)
 
             elif event.type == 'content_block_stop':
                 if current_block_type:
@@ -800,19 +849,31 @@ async def chat_anthropic(handler, api_key, model, messages):
                     current_block_type = ''
 
         final_msg = await stream.get_final_message()
-        final_text = await stream.get_final_text()
-        stop_reason = getattr(final_msg, 'stop_reason', 'end_turn')
+        # Not get_final_text(): it raises when the turn has no text block
+        # (tool_use only). Concatenate text blocks instead (empty if none).
+        final_text = ''.join(
+            b.text for b in final_msg.content if b.type == 'text'
+        )
+        assistant_blocks = [b.model_dump(mode='json', exclude_none=True)
+                            for b in final_msg.content]
+        tool_calls = [
+            {'id': b.id, 'name': b.name, 'input': b.input}
+            for b in final_msg.content if b.type == 'tool_use'
+        ]
+        stop_reason = getattr(final_msg, 'stop_reason', 'end_turn') or 'end_turn'
         _send_sse(handler, {'type': 'message_done',
                             'text': final_text,
-                            'stop_reason': stop_reason or 'end_turn'})
+                            'stop_reason': stop_reason,
+                            'tool_calls': tool_calls,
+                            'assistant_blocks': assistant_blocks})
 
 
-def _build_bedrock_converse_body(messages, model):
+def _build_bedrock_converse_body(messages, model, tools=None):
     """Build the JSON body for a Bedrock Converse request.
 
-    Folds system messages into the top-level `system` field, wraps each
-    message's content as a [{text}] block, and appends action protocol
-    JSON inline (matching the chat_anthropic convention).
+    System messages fold into the top-level `system` field. Assistant turns
+    carry their native content blocks verbatim (`assistantBlocks`) so reasoning
+    signatures round trip. Tool results become `toolResult` blocks.
 
     Extended thinking is enabled only for Claude/Anthropic models, since
     non-Anthropic Bedrock models reject `additionalModelRequestFields.thinking`.
@@ -821,33 +882,61 @@ def _build_bedrock_converse_body(messages, model):
     system_blocks = []
     for m in messages:
         role = m.get('role')
-        content = m.get('content', '')
-        actions = m.get('actions')
-        if actions:
-            content += '\n\n[Actions proposed]\n' + json.dumps(actions)
-
         if role == 'system':
-            system_blocks.append({'text': content})
+            system_blocks.append({'text': m.get('content', '')})
+        elif role == 'assistant':
+            blocks = m.get('assistantBlocks')
+            if blocks:
+                api_messages.append({'role': 'assistant', 'content': blocks})
+            else:
+                api_messages.append({'role': 'assistant',
+                                     'content': [{'text': m.get('content', '')}]})
         else:
-            api_messages.append({'role': role, 'content': [{'text': content}]})
+            tool_results = m.get('toolResults')
+            if tool_results:
+                content = [
+                    {'toolResult': {
+                        'toolUseId': r['id'],
+                        'content': [{'text': r['result']}],
+                        'status': 'error' if r.get('isError') else 'success',
+                    }}
+                    for r in tool_results
+                ]
+                api_messages.append({'role': 'user', 'content': content})
+            else:
+                api_messages.append({'role': 'user',
+                                     'content': [{'text': m.get('content', '')}]})
 
+    # No maxTokens: Converse defaults it to the model's own maximum, so we never
+    # exceed a model-specific ceiling (e.g. Nova Lite caps at 10000).
     body = {
-        'messages': api_messages,
-        'inferenceConfig': {'maxTokens': 32000}
+        'messages': api_messages
     }
+    if tools:
+        body['toolConfig'] = {
+            'tools': [
+                {'toolSpec': {
+                    'name': t['name'],
+                    'description': t['description'],
+                    'inputSchema': {'json': t['parameters']},
+                }}
+                for t in tools
+            ]
+        }
     if system_blocks:
         body['system'] = system_blocks
 
     model_lower = model.lower()
     if 'claude' in model_lower or 'anthropic' in model_lower:
         body['additionalModelRequestFields'] = {
-            'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+            'thinking': _anthropic_thinking_config(model)
         }
     return body
 
 
 @sse_serializer
-async def chat_bedrock_converse(handler, api_key, region, model, messages):
+async def chat_bedrock_converse(handler, api_key, region, model, messages,
+                               tools=None):
     """Serializer for Bedrock Converse Stream API.
 
     Uses bearer-token auth against bedrock-runtime.{region}.amazonaws.com.
@@ -855,7 +944,7 @@ async def chat_bedrock_converse(handler, api_key, region, model, messages):
     tokens, so no AWS SigV4 or boto3 is needed.
     """
     _validate_bedrock_region(region)
-    body = _build_bedrock_converse_body(messages, model)
+    body = _build_bedrock_converse_body(messages, model, tools)
     url = (f'https://bedrock-runtime.{region}.amazonaws.com'
            f'/model/{urllib.parse.quote(model, safe="")}/converse-stream')
     req_headers = {
@@ -865,9 +954,19 @@ async def chat_bedrock_converse(handler, api_key, region, model, messages):
     }
 
     parser = EventStreamParser()
-    text_accumulated = ''
-    current_block = None
+    # Accumulate content blocks by index so reasoning/tool_use round trip and
+    # parallel tool calls stay distinct.
+    blocks = {}            # contentBlockIndex -> accumulator dict
+    display_block = None   # currently streaming display block ('text'|'thinking')
     stop_reason = 'end_turn'
+
+    def set_display(kind):
+        nonlocal display_block
+        if display_block != kind:
+            if display_block:
+                _block_stop(handler, display_block)
+            _block_start(handler, kind)
+            display_block = kind
 
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream('POST', url, headers=req_headers,
@@ -889,42 +988,79 @@ async def chat_bedrock_converse(handler, api_key, region, model, messages):
                         raise ValueError(f'Bedrock Converse {exc_type}: {msg}')
 
                     event_type = hdrs.get(':event-type')
-                    if event_type == 'contentBlockDelta':
+                    if event_type == 'contentBlockStart':
                         data_obj = json.loads(payload)
+                        idx = data_obj.get('contentBlockIndex')
+                        start = data_obj.get('start', {})
+                        if 'toolUse' in start:
+                            tu = start['toolUse']
+                            blocks[idx] = {'kind': 'toolUse',
+                                           'toolUseId': tu['toolUseId'],
+                                           'name': tu['name'], 'input': ''}
+                    elif event_type == 'contentBlockDelta':
+                        data_obj = json.loads(payload)
+                        idx = data_obj.get('contentBlockIndex')
                         delta = data_obj.get('delta', {})
                         if 'text' in delta:
-                            if current_block != 'text':
-                                if current_block:
-                                    _block_stop(handler, current_block)
-                                _block_start(handler, 'text')
-                                current_block = 'text'
-                            text_accumulated += delta['text']
-                            display = _extract_json_content(text_accumulated)
-                            if display:
-                                _block_delta(handler, 'text', display)
+                            b = blocks.setdefault(idx, {'kind': 'text', 'text': ''})
+                            b['text'] += delta['text']
+                            set_display('text')
+                            _block_delta(handler, 'text', delta['text'])
                         elif 'reasoningContent' in delta:
                             rc = delta['reasoningContent']
+                            b = blocks.setdefault(idx, {'kind': 'reasoning',
+                                                        'text': '',
+                                                        'signature': None,
+                                                        'redacted': None})
                             if 'text' in rc:
-                                if current_block != 'thinking':
-                                    if current_block:
-                                        _block_stop(handler, current_block)
-                                    _block_start(handler, 'thinking')
-                                    current_block = 'thinking'
+                                b['text'] += rc['text']
+                                set_display('thinking')
                                 _block_delta(handler, 'thinking', rc['text'])
-                    elif event_type == 'contentBlockStop':
-                        if current_block:
-                            _block_stop(handler, current_block)
-                            current_block = None
+                            elif 'signature' in rc:
+                                b['signature'] = rc['signature']
+                            elif 'redactedContent' in rc:
+                                b['redacted'] = rc['redactedContent']
+                        elif 'toolUse' in delta:
+                            b = blocks.setdefault(idx, {'kind': 'toolUse',
+                                                        'toolUseId': '',
+                                                        'name': '', 'input': ''})
+                            b['input'] += delta['toolUse'].get('input', '')
                     elif event_type == 'messageStop':
                         data_obj = json.loads(payload)
                         stop_reason = data_obj.get('stopReason', stop_reason)
 
-    if current_block:
-        _block_stop(handler, current_block)
+    if display_block:
+        _block_stop(handler, display_block)
+
+    assistant_blocks = []
+    tool_calls = []
+    text_parts = []
+    for idx in sorted(blocks):
+        b = blocks[idx]
+        if b['kind'] == 'text':
+            assistant_blocks.append({'text': b['text']})
+            text_parts.append(b['text'])
+        elif b['kind'] == 'reasoning':
+            if b['redacted'] is not None:
+                assistant_blocks.append(
+                    {'reasoningContent': {'redactedContent': b['redacted']}})
+            else:
+                rt = {'text': b['text']}
+                if b['signature'] is not None:
+                    rt['signature'] = b['signature']
+                assistant_blocks.append({'reasoningContent': {'reasoningText': rt}})
+        elif b['kind'] == 'toolUse':
+            parsed = json.loads(b['input'] or '{}')
+            assistant_blocks.append({'toolUse': {
+                'toolUseId': b['toolUseId'], 'name': b['name'], 'input': parsed}})
+            tool_calls.append({'id': b['toolUseId'], 'name': b['name'],
+                               'input': parsed})
 
     _send_sse(handler, {'type': 'message_done',
-                        'text': text_accumulated,
-                        'stop_reason': stop_reason})
+                        'text': ''.join(text_parts),
+                        'stop_reason': stop_reason,
+                        'tool_calls': tool_calls,
+                        'assistant_blocks': assistant_blocks})
 
 
 class ChatHandler(APIHandler):
@@ -932,6 +1068,7 @@ class ChatHandler(APIHandler):
     async def post(self):
         data = self.get_json_body()
         messages = data.get('messages', [])
+        tools = data.get('tools', [])
 
         config = await load_config()
         provider, model, api_key, base_url = await resolve_chat_config(config)
@@ -951,7 +1088,7 @@ class ChatHandler(APIHandler):
                 self.finish(json.dumps({'error': 'Enki Gate not configured. Run device flow first.'}))
                 return
             enki_base = enki_url.rstrip('/') + '/v1'
-            await chat_openai(self, enki_token, enki_model, messages,
+            await chat_openai(self, enki_token, enki_model, messages, tools,
                               base_url=enki_base)
             return
 
@@ -960,7 +1097,8 @@ class ChatHandler(APIHandler):
                 self.set_status(500)
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
-            await chat_openai(self, api_key, model, messages, base_url=base_url)
+            await chat_openai(self, api_key, model, messages, tools,
+                              base_url=base_url)
             return
 
         if provider == 'anthropic':
@@ -968,7 +1106,7 @@ class ChatHandler(APIHandler):
                 self.set_status(500)
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
-            await chat_anthropic(self, api_key, model, messages)
+            await chat_anthropic(self, api_key, model, messages, tools)
             return
 
         if provider == 'bedrock':
@@ -980,7 +1118,8 @@ class ChatHandler(APIHandler):
                 region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1')
             else:
                 region = config.get('bedrockRegion', 'us-east-1')
-            await chat_bedrock_converse(self, api_key, region, model, messages)
+            await chat_bedrock_converse(self, api_key, region, model, messages,
+                                        tools)
             return
 
         self.set_status(400)
