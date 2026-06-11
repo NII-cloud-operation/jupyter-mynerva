@@ -2519,7 +2519,8 @@ export function activatePanel(
   shell: JupyterFrontEnd.IShell,
   contextEngine: ContextEngine,
   liveQuery: NblibramLiveQuery
-): void {
+): MynervaPanel {
   const panel = new MynervaPanel(contextEngine, liveQuery);
   shell.add(panel, 'right', { rank: 1000 });
+  return panel;
 }

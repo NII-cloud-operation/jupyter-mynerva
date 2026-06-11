@@ -5,6 +5,38 @@
   background: var(--jp-layout-color1);
 }
 
+/* Floating edge handle to open the panel on Notebook 7 (no right tab bar). */
+.jp-Mynerva-floatingToggle {
+  position: fixed;
+  right: 0;
+  top: 25%;
+  transform: translateY(-50%);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 44px;
+  padding: 0;
+  margin: 0;
+  background: var(--jp-layout-color1);
+  border: 1px solid var(--jp-border-color1);
+  border-right: none;
+  border-radius: 6px 0 0 6px;
+  box-shadow: -1px 1px 5px rgb(0 0 0 / 18%);
+  color: var(--jp-ui-font-color1);
+  cursor: pointer;
+}
+
+.jp-Mynerva-floatingToggle:hover {
+  background: var(--jp-layout-color2);
+}
+
+.jp-Mynerva-floatingToggle svg {
+  width: 22px;
+  height: 22px;
+}
+
 .jp-Mynerva-header {
   display: flex;
   align-items: center;
