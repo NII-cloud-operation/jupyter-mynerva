@@ -74,6 +74,9 @@ interface IConfig {
   enkiGateToken?: string;
   enkiGateModel?: string;
   enkiGateExpiresAt?: number;
+  // Advanced toggles (see backend _advanced_flag); absent = use env default.
+  relaxToolNarration?: boolean;
+  summaryToolPriming?: boolean;
 }
 
 interface IDefaultConfig {
@@ -102,6 +105,8 @@ interface IProvidersResponse {
   defaultsOnly?: boolean;
   defaultsError?: string;
   nbsearchAvailable?: boolean;
+  relaxToolNarration?: boolean;
+  summaryToolPriming?: boolean;
   bedrockRegions: IBedrockRegion[];
 }
 
@@ -533,6 +538,10 @@ interface ISettingsViewProps {
   defaultsUnavailable: string | null;
   onSave: (config: IConfig) => void;
   warning?: string;
+  // Effective advanced-flag values (config.json merged over env), used to seed
+  // the Advanced section checkboxes.
+  relaxToolNarration: boolean;
+  summaryToolPriming: boolean;
 }
 
 function CopyableCode({ code }: { code: string }): React.ReactElement {
@@ -739,11 +748,16 @@ function SettingsView({
   defaults,
   defaultsUnavailable,
   onSave,
-  warning
+  warning,
+  relaxToolNarration,
+  summaryToolPriming
 }: ISettingsViewProps): React.ReactElement {
   const [useDefault, setUseDefault] = React.useState(
     defaultsUnavailable !== null ? false : (config.useDefault ?? false)
   );
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
+  const [relaxNarration, setRelaxNarration] = React.useState(relaxToolNarration);
+  const [summaryPriming, setSummaryPriming] = React.useState(summaryToolPriming);
   const initialProvider = providers.some(p => p.id === config.provider)
     ? config.provider
     : providers[0]?.id || config.provider;
@@ -842,7 +856,9 @@ function SettingsView({
         useDefault,
         openaiBaseUrl:
           provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined,
-        bedrockRegion: provider === 'bedrock' ? bedrockRegion : undefined
+        bedrockRegion: provider === 'bedrock' ? bedrockRegion : undefined,
+        relaxToolNarration: relaxNarration,
+        summaryToolPriming: summaryPriming
       };
       await saveConfig(newConfig);
       onSave(newConfig);
@@ -977,6 +993,42 @@ function SettingsView({
       {warning && !useDefault && (
         <div className="jp-Mynerva-settings-error">{warning}</div>
       )}
+      {provider !== 'enki-gate' && (
+        <div className="jp-Mynerva-settings-advanced">
+          <button
+            className="jp-Mynerva-settings-advanced-toggle"
+            onClick={() => setAdvancedOpen(o => !o)}
+          >
+            {advancedOpen ? '▾' : '▸'} Advanced settings
+          </button>
+          {advancedOpen && (
+            <>
+              <div className="jp-Mynerva-settings-field jp-Mynerva-settings-checkbox">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={relaxNarration}
+                    onChange={e => setRelaxNarration(e.target.checked)}
+                  />
+                  Allow tool calls without an explanation (for models that
+                  narrate inconsistently)
+                </label>
+              </div>
+              <div className="jp-Mynerva-settings-field jp-Mynerva-settings-checkbox">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={summaryPriming}
+                    onChange={e => setSummaryPriming(e.target.checked)}
+                  />
+                  Prime nbsearch summaries with a no-op tool (suppresses
+                  reasoning leakage on Gemma/vLLM)
+                </label>
+              </div>
+            </>
+          )}
+        </div>
+      )}
       {error && <div className="jp-Mynerva-settings-error">{error}</div>}
       {provider !== 'enki-gate' && (
         <button
@@ -1045,9 +1097,16 @@ const MAX_RETRIES = 2;
  * problems to feed back to the model, or [] if the turn is acceptable. Add
  * rules here as needed; the retry loop is generic.
  */
-function validateAssistantResult(result: IChatResult): string[] {
+function validateAssistantResult(
+  result: IChatResult,
+  relaxToolNarration: boolean
+): string[] {
   const errors: string[] = [];
-  if (result.toolCalls.length > 0 && result.text.trim() === '') {
+  if (
+    !relaxToolNarration &&
+    result.toolCalls.length > 0 &&
+    result.text.trim() === ''
+  ) {
     errors.push(
       'You proposed actions with no explanation. Tool calls are shown to the ' +
         'user as approval requests, so first state in natural language what ' +
@@ -1398,6 +1457,8 @@ function MynervaComponent({
   const [defaultsError, setDefaultsError] = React.useState<string | null>(null);
   const [defaultsOnly, setDefaultsOnly] = React.useState(false);
   const [nbsearchAvailable, setNbsearchAvailable] = React.useState(false);
+  const [relaxToolNarration, setRelaxToolNarration] = React.useState(false);
+  const [summaryToolPriming, setSummaryToolPriming] = React.useState(false);
   const [config, setConfig] = React.useState<IConfig | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
   const [messages, setMessages] = React.useState<IMessage[]>([]);
@@ -1445,6 +1506,8 @@ function MynervaComponent({
           setDefaultsError(providersRes.defaultsError);
         }
         setNbsearchAvailable(!!providersRes.nbsearchAvailable);
+        setRelaxToolNarration(!!providersRes.relaxToolNarration);
+        setSummaryToolPriming(!!providersRes.summaryToolPriming);
         if (providersRes.defaultsOnly) {
           setDefaultsOnly(true);
         }
@@ -2262,7 +2325,7 @@ function MynervaComponent({
     let apiMessages = history;
     let result = await runChat(withSystem(apiMessages), signal);
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const errors = validateAssistantResult(result);
+      const errors = validateAssistantResult(result, relaxToolNarration);
       if (errors.length === 0) {
         break;
       }
@@ -2333,6 +2396,10 @@ function MynervaComponent({
 
   const handleConfigSave = (newConfig: IConfig) => {
     setConfig(newConfig);
+    // Reflect the saved advanced toggles immediately (e.g. the narration
+    // validator) without waiting for a providers refetch.
+    setRelaxToolNarration(!!newConfig.relaxToolNarration);
+    setSummaryToolPriming(!!newConfig.summaryToolPriming);
     setShowSettings(false);
   };
 
@@ -2462,6 +2529,8 @@ function MynervaComponent({
           }
           onSave={handleConfigSave}
           warning={config?.configWarning || config?.decryptError}
+          relaxToolNarration={relaxToolNarration}
+          summaryToolPriming={summaryToolPriming}
         />
       ) : (
         <ChatView

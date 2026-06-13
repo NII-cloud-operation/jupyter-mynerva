@@ -20,6 +20,19 @@ def NBSearchDB(*args, **kwargs):
     return _NBSearchDB(*args, **kwargs)
 
 
+# A tool with no useful action, attached to summary requests when
+# summaryToolPriming is enabled: its mere presence shifts Gemma out of its
+# chain-of-thought narration mode. tool_choice stays 'auto' (the priming has no
+# effect under 'none'); a guard below handles the model occasionally calling it.
+_SUMMARY_PRIMING_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'noop',
+        'description': 'Unused. Do not call this; answer directly.',
+        'parameters': {'type': 'object', 'properties': {}},
+    },
+}
+
 _NBSEARCH_NOTEBOOK_FL = [
     'id',
     'filename',
@@ -656,6 +669,21 @@ class NBSearchHandler(APIHandler):
             if base_url:
                 kwargs['base_url'] = base_url
             client = routes.AsyncOpenAI(**kwargs)
+            if base_url:
+                # Custom endpoint (vLLM etc.): use chat/completions like the
+                # chat path; its Responses API leaks reasoning into the summary.
+                create = {'model': model, 'messages': messages}
+                if routes._advanced_flag(
+                        config, 'summaryToolPriming', routes._SUMMARY_TOOL_PRIMING):
+                    create['tools'] = [_SUMMARY_PRIMING_TOOL]
+                    create['tool_choice'] = 'auto'
+                msg = (await client.chat.completions.create(**create)).choices[0].message
+                if not (msg.content or '').strip() and msg.tool_calls:
+                    # Model called the priming tool instead of answering; retry
+                    # once without it so the summary isn't lost.
+                    msg = (await client.chat.completions.create(
+                        model=model, messages=messages)).choices[0].message
+                return (msg.content or '').strip()
             response = await client.responses.create(model=model, input=messages)
             return response.output_text.strip()
         if provider == 'enki-gate':

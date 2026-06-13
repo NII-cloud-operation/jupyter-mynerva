@@ -159,6 +159,25 @@ if 'MYNERVA_BEDROCK_REGION' in os.environ:
 if os.environ.get('MYNERVA_DEFAULTS_ONLY'):
     _DEFAULT_CONFIG['defaults_only'] = True
 
+# Advanced behavior toggles. Each is an env default that config.json can
+# override per user (see _advanced_flag). They exist because tuning weaker
+# self-hosted models is trial-and-error.
+#
+# _RELAX_TOOL_NARRATION: drop the "explain before acting" requirement, which
+# otherwise triggers retry loops on models that narrate inconsistently.
+# _SUMMARY_TOOL_PRIMING: attach a no-op tool to nbsearch summary requests; on
+# Gemma served via vLLM this suppresses the chain-of-thought preamble that
+# otherwise leaks into (and, via map-reduce, compounds in) the summary text.
+_RELAX_TOOL_NARRATION = bool(os.environ.get('MYNERVA_RELAX_TOOL_NARRATION'))
+_SUMMARY_TOOL_PRIMING = bool(os.environ.get('MYNERVA_SUMMARY_TOOL_PRIMING'))
+
+
+def _advanced_flag(config, key, env_default):
+    """Effective value of an advanced flag: config.json overrides the env
+    default; the env default applies only when the key is absent."""
+    value = config.get(key)
+    return bool(value) if value is not None else env_default
+
 
 def _load_model_spec():
     """Load allow/deny glob patterns from models.json."""
@@ -563,7 +582,11 @@ class ProvidersHandler(APIHandler):
             'defaults': defaults,
             'filters': filters,
             'bedrockRegions': _load_bedrock_regions(),
-            'nbsearchAvailable': has_nbsearch_config(self._handler_config())
+            'nbsearchAvailable': has_nbsearch_config(self._handler_config()),
+            'relaxToolNarration': _advanced_flag(
+                config, 'relaxToolNarration', _RELAX_TOOL_NARRATION),
+            'summaryToolPriming': _advanced_flag(
+                config, 'summaryToolPriming', _SUMMARY_TOOL_PRIMING)
         }
         if defaults_error:
             result['defaultsError'] = defaults_error
@@ -595,6 +618,13 @@ def _init_sse(handler):
 def _send_sse(handler, data):
     """Send a single SSE event."""
     handler.write(f'data: {json.dumps(data)}\n\n')
+    handler.flush()
+
+
+def _send_sse_comment(handler, text):
+    """Send an SSE comment line (ignored by the client) to keep the connection
+    alive — and proxies from idling out — through a long upstream wait."""
+    handler.write(f': {text}\n\n')
     handler.flush()
 
 
@@ -685,6 +715,59 @@ def _build_openai_input(messages):
     return result
 
 
+def _build_completions_tools(tools):
+    """Wrap provider-neutral tool defs into the chat/completions function shape."""
+    return [
+        {
+            'type': 'function',
+            'function': {
+                'name': t['name'],
+                'description': t['description'],
+                'parameters': t['parameters'],
+            },
+        }
+        for t in tools
+    ]
+
+
+def _build_completions_messages(messages):
+    """Build the chat/completions `messages` array from the message history.
+
+    Assistant turns rebuild their tool calls from `toolCalls`; tool results
+    become `tool` messages keyed by `tool_call_id`. The Responses-style
+    `assistantBlocks` are not used on this path.
+    """
+    result = []
+    for m in messages:
+        role = m.get('role', 'user')
+        if role == 'system':
+            result.append({'role': 'system', 'content': m.get('content', '')})
+        elif role == 'assistant':
+            tool_calls = m.get('toolCalls')
+            if tool_calls:
+                result.append({
+                    'role': 'assistant',
+                    'content': m.get('content') or None,
+                    'tool_calls': [
+                        {'id': c['id'], 'type': 'function',
+                         'function': {'name': c['name'],
+                                      'arguments': json.dumps(c['input'])}}
+                        for c in tool_calls
+                    ],
+                })
+            else:
+                result.append({'role': 'assistant', 'content': m.get('content', '')})
+        else:
+            tool_results = m.get('toolResults')
+            if tool_results:
+                for r in tool_results:
+                    result.append({'role': 'tool', 'tool_call_id': r['id'],
+                                   'content': r['result']})
+            else:
+                result.append({'role': 'user', 'content': m.get('content', '')})
+    return result
+
+
 @sse_serializer
 async def chat_openai(handler, api_key, model, messages, tools=None, base_url=None):
     """Serializer for OpenAI Responses API (used also for Enki Gate)."""
@@ -751,6 +834,61 @@ async def chat_openai(handler, api_key, model, messages, tools=None, base_url=No
         elif event.type == 'response.failed':
             error_msg = str(getattr(event, 'error', 'Unknown error'))
             _send_sse(handler, {'type': 'error', 'error': error_msg})
+
+
+# Seconds between SSE keep-alives while awaiting a non-streaming upstream reply.
+_COMPLETIONS_KEEPALIVE_SECONDS = 15
+
+
+@sse_serializer
+async def chat_openai_completions(handler, api_key, model, messages, tools=None,
+                                  base_url=None):
+    """Serializer for the OpenAI chat/completions API (vLLM and other
+    OpenAI-compatible endpoints).
+
+    The upstream request is non-streaming: vLLM's streaming Gemma parsers
+    corrupt nested tool-call arguments (leaving raw <|"|> delimiters) and leak
+    reasoning into `content`, while its non-streaming path parses both cleanly.
+    A periodic SSE keep-alive holds the client connection (and any reverse
+    proxy) open through the upstream wait.
+    """
+    kwargs = {'api_key': api_key or ''}
+    if base_url:
+        kwargs['base_url'] = base_url
+    client = AsyncOpenAI(**kwargs)
+
+    create_kwargs = {
+        'model': model,
+        'messages': _build_completions_messages(messages),
+    }
+    if tools:
+        create_kwargs['tools'] = _build_completions_tools(tools)
+
+    request = asyncio.ensure_future(
+        client.chat.completions.create(**create_kwargs))
+    while not request.done():
+        done, _ = await asyncio.wait(
+            {request}, timeout=_COMPLETIONS_KEEPALIVE_SECONDS)
+        if not done:
+            _send_sse_comment(handler, 'keepalive')
+    choice = request.result().choices[0]
+    message = choice.message
+
+    text = message.content or ''
+    if text:
+        _block_start(handler, 'text')
+        _block_delta(handler, 'text', text)
+        _block_stop(handler, 'text')
+
+    tool_calls = [
+        {'id': tc.id, 'name': tc.function.name,
+         'input': json.loads(tc.function.arguments or '{}')}
+        for tc in (message.tool_calls or [])
+    ]
+    _send_sse(handler, {'type': 'message_done',
+                        'text': text,
+                        'stop_reason': choice.finish_reason,
+                        'tool_calls': tool_calls})
 
 
 def _anthropic_thinking_config(model):
@@ -1097,8 +1235,14 @@ class ChatHandler(APIHandler):
                 self.set_status(500)
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
-            await chat_openai(self, api_key, model, messages, tools,
-                              base_url=base_url)
+            # A custom endpoint (base_url) means an OpenAI-compatible server such
+            # as vLLM, which serves tool calling on chat/completions rather than
+            # the Responses API. api.openai.com itself keeps the Responses path.
+            if base_url:
+                await chat_openai_completions(self, api_key, model, messages,
+                                              tools, base_url=base_url)
+            else:
+                await chat_openai(self, api_key, model, messages, tools)
             return
 
         if provider == 'anthropic':
