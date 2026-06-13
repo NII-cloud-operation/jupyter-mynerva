@@ -52,9 +52,10 @@ from jupyter_mynerva.handlers.nbsearch import (
     _build_nbsearch_query,
     _paginate_cells_result,
     _source_only_cells,
-    _NBSEARCH_SUMMARY_MAX_DEPTH,
     _is_context_exceeded,
-    _truncate_for_floor,
+    _cell_headings,
+    _window_indexes,
+    _render_markdown,
 )
 
 
@@ -286,9 +287,9 @@ def test_source_only_cells_flattens_and_drops_outputs():
 
 
 @pytest.mark.asyncio
-async def test_summarize_feeds_flat_source_only_cell_list_to_map_reduce(monkeypatch):
-    # Regression: map-reduce must receive the actual cell list (so it can split
-    # to fit context), not a single wrapper object.
+async def test_summarize_renders_markdown_window_without_indexes(monkeypatch):
+    # The model receives Markdown: a heading backbone, the matched cell (flagged
+    # "!matched!") with its neighbor window in full, and no cell indexes.
     async def fake_load_config():
         return {}
 
@@ -300,32 +301,37 @@ async def test_summarize_feeds_flat_source_only_cell_list_to_map_reduce(monkeypa
 
     captured = {}
 
-    async def fake_adaptive(provider, model, api_key, base_url, config,
-                            build_messages, segments):
-        captured['segments'] = segments
-        captured['payload'] = json.loads(build_messages(segments)[1]['content'])
-        return 'summary'
+    class _Capture:
+        _summarize = NBSearchHandler._summarize
+        log = logging.getLogger('test-nbsearch')
 
-    handler = MagicMock()
-    handler._summarize_adaptive = fake_adaptive
+        async def _run_summary(self, provider, model, api_key, base_url, config,
+                               messages):
+            captured['content'] = messages[1]['content']
+            return 'summary'
 
+    handler = _Capture()
     cells_result = {
         'cells': [
-            {'_index': 0, 'cell_type': 'code', 'source': ['a'], 'outputs': ['x']},
-            {'_index': 1, 'cell_type': 'code', 'source': ['b']},
+            {'cell_type': 'markdown', 'source': ['# Intro']},  # _index 0 omitted
+            {'_index': 1, 'cell_type': 'code', 'source': ['setup()'], 'outputs': ['x']},
+            {'_index': 2, 'cell_type': 'code', 'source': ['target()']},
+            {'_index': 3, 'cell_type': 'markdown', 'source': ['## Tail']},
         ],
     }
 
     out = await NBSearchHandler._summarize(
-        handler, 'focus', 'f.ipynb', cells_result, 'instruction', 'echo-text')
+        handler, 'focus', 'f.ipynb', cells_result, [2],
+        'instruction', 'echo-text')
 
     assert out == 'summary'
-    # Flat list of source-only cells (outputs dropped), each keeping _index.
-    assert captured['segments'] == [
-        {'_index': 0, 'cell_type': 'code', 'source': ['a']},
-        {'_index': 1, 'cell_type': 'code', 'source': ['b']},
-    ]
-    assert captured['payload']['cells'] == captured['segments']
+    content = captured['content']
+    assert 'focus: focus' in content
+    assert '!matched!' in content                 # matched cell flagged
+    assert '```\ntarget()\n```' in content        # matched code in full
+    assert '# Intro' in content                   # heading backbone kept
+    assert 'outputs' not in content               # outputs dropped
+    assert 'セル' not in content and '_index' not in content  # no indexes
 
 
 def test_paginate_cells_result_uses_budget_and_next_start():
@@ -409,11 +415,15 @@ async def test_search_nbsearch_notebooks_queries_notebook_core(monkeypatch):
         assert reference['count'] >= 10000
         return {'cells': [{'cell_type': 'code', 'source': ['print(1)']}]}
 
-    async def fake_summarize_result(self, focus, path, cells):
+    async def fake_summarize_result(self, focus, path, cells, matched_indexes):
         return 'focus に関連する notebook です。'
+
+    async def fake_matched_cell_indexes(self, db, notebook_id, solr_query):
+        return []
 
     monkeypatch.setattr(NBSearchHandler, '_get_search_reference_cells', fake_get_search_reference_cells)
     monkeypatch.setattr(NBSearchHandler, '_summarize_result', fake_summarize_result)
+    monkeypatch.setattr(NBSearchHandler, '_matched_cell_indexes', fake_matched_cell_indexes)
 
     handler = _make_nbsearch_handler(
         {'NBSearchDB': {'solr_base_url': 'http://solr:8983'}},
@@ -488,22 +498,29 @@ async def test_summary_cells_from_search_returns_locator_summary(monkeypatch):
             ],
         }
 
-    async def fake_summarize_search_cells(self, focus, filename, cells, coverage):
+    async def fake_summarize_search_cells(self, focus, filename, cells,
+                                          matched_indexes, coverage):
         captured['focus'] = focus
         captured['filename'] = filename
         captured['cells'] = cells
+        captured['matched_indexes'] = matched_indexes
         captured['coverage'] = coverage
-        return 'セル12-13でGalaxy更新前確認と更新処理をしている。'
+        return 'Galaxy更新前確認と更新処理をしている。'
+
+    async def fake_matched_cell_indexes(self, db, notebook_id, solr_query):
+        return [12, 13]
 
     monkeypatch.setattr('jupyter_mynerva.handlers.nbsearch.NBSearchDB', FakeDB)
     monkeypatch.setattr(NBSearchHandler, '_get_search_reference_cells', fake_get_search_reference_cells)
     monkeypatch.setattr(NBSearchHandler, '_summarize_search_cells', fake_summarize_search_cells)
+    monkeypatch.setattr(NBSearchHandler, '_matched_cell_indexes', fake_matched_cell_indexes)
 
     reference_id = 'search-test/r1/ref1'
     _NBSEARCH_REFERENCE_CACHE[reference_id] = {
         'filename': 'galaxy.ipynb',
         'notebookId': 'notebook',
         'query': {'start': 0},
+        'solrQuery': 'galaxy',
         'count': 10000,
     }
     try:
@@ -521,14 +538,15 @@ async def test_summary_cells_from_search_returns_locator_summary(monkeypatch):
     assert captured['no_filter'] is True
     assert captured['focus'] == 'Galaxy更新の手順を確認したい'
     assert captured['filename'] == 'galaxy.ipynb'
-    assert captured['coverage'] == 'full 2/2 cells'
+    assert captured['matched_indexes'] == [12, 13]
+    assert captured['coverage'] == '2 matched / 2 cells'
     assert result == {
         'type': 'summaryCellsFromSearch',
         'referenceId': reference_id,
         'filename': 'galaxy.ipynb',
         'cellCount': 2,
-        'coverage': 'full 2/2 cells',
-        'summary': 'セル12-13でGalaxy更新前確認と更新処理をしている。',
+        'coverage': '2 matched / 2 cells',
+        'summary': 'Galaxy更新前確認と更新処理をしている。',
         'readAction': {
             'type': 'getCellsFromSearch',
             'referenceId': reference_id,
@@ -2775,101 +2793,132 @@ def test_is_context_exceeded_ignores_other_errors(message):
     assert not _is_context_exceeded(RuntimeError(message))
 
 
-def test_truncate_for_floor_clips_nested_strings():
-    value = {'source': 'x' * 5000, 'cells': [{'text': 'y' * 5000}], 'n': 3}
-    clipped = _truncate_for_floor(value, limit=10)
-    assert clipped['source'] == 'x' * 10
-    assert clipped['cells'][0]['text'] == 'y' * 10
-    assert clipped['n'] == 3
+def test_window_indexes_includes_neighbors_and_top_fallback():
+    assert _window_indexes([5], 1) == {4, 5, 6}
+    assert _window_indexes([3, 10], 0) == {3, 10}
+    # No match: anchor on the notebook start.
+    assert _window_indexes([], 2) == {-2, -1, 0, 1, 2}
+
+
+def test_cell_headings_only_markdown_atx():
+    assert _cell_headings(
+        {'cell_type': 'markdown', 'source': ['# A\n', 'body\n', '## B']}
+    ) == ['# A', '## B']
+    assert _cell_headings({'cell_type': 'code', 'source': ['# not a heading']}) == []
+
+
+def test_render_markdown_window_backbone_marker_no_index():
+    cells = [
+        {'_index': 0, 'cell_type': 'markdown', 'source': '# Title\nintro'},
+        {'_index': 1, 'cell_type': 'code', 'source': 'import x'},
+        {'_index': 2, 'cell_type': 'code', 'source': 'target'},
+        {'_index': 3, 'cell_type': 'markdown', 'source': '## Tail'},
+    ]
+    md = _render_markdown(cells, [2], window_keep={2}, backbone_keep={0, 3})
+    assert '!matched!' in md                  # matched cell flagged
+    assert '```\ntarget\n```' in md           # window cell in full (code fenced)
+    assert '# Title' in md and '## Tail' in md  # heading backbone
+    assert 'intro' not in md                  # backbone is heading-only
+    assert 'import x' not in md               # cell outside window/backbone dropped
+    assert '_index' not in md and '2' not in md  # no cell indexes
+    # Everything dropped renders to an empty document (the guaranteed-fit floor).
+    assert _render_markdown(cells, [2], set(), set()) == ''
 
 
 class _FakeSummarizer:
-    """Duck-typed stand-in exercising NBSearchHandler._summarize_adaptive.
+    """Duck-typed stand-in exercising NBSearchHandler._summarize. `_run_summary`
+    overflows whenever the rendered Markdown exceeds `max_chars`, forcing the
+    window to shrink."""
 
-    `_run_summary` fails with a context-overflow error whenever it is given
-    more than `max_fit` cells, so the recursion is forced to split.
-    """
+    _summarize = NBSearchHandler._summarize
 
-    _summarize_adaptive = NBSearchHandler._summarize_adaptive
-    _emit_progress = NBSearchHandler._emit_progress
-    _on_progress = None
-
-    def __init__(self, max_fit):
-        self.max_fit = max_fit
+    def __init__(self, max_chars):
+        self.max_chars = max_chars
         self.log = logging.getLogger('test-nbsearch')
-        self.sizes = []
+        self.attempts = []
 
     async def _run_summary(self, provider, model, api_key, base_url, config,
                            messages):
-        cells = json.loads(messages[1]['content'])['cells']
-        self.sizes.append(len(cells))
-        if len(cells) > self.max_fit:
+        content = messages[1]['content']
+        self.attempts.append(len(content))
+        if len(content) > self.max_chars:
             raise RuntimeError('exceeds the available context size')
-        return f'summary-of-{len(cells)}'
+        return content
 
 
-def _build_summary_messages(segments):
-    return [
-        {'role': 'system', 'content': 'summarize'},
-        {'role': 'user', 'content': json.dumps({'cells': segments})},
-    ]
+def _mock_openai_config(monkeypatch):
+    async def fake_load_config():
+        return {}
+
+    async def fake_resolve(config):
+        return ('openai', 'm', 'k', '')
+
+    monkeypatch.setattr('jupyter_mynerva.routes.load_config', fake_load_config)
+    monkeypatch.setattr('jupyter_mynerva.routes.resolve_chat_config', fake_resolve)
 
 
-async def test_summarize_adaptive_single_shot_when_it_fits():
-    fake = _FakeSummarizer(max_fit=10)
-    result = await fake._summarize_adaptive(
-        'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3])
-    assert result == 'summary-of-3'
-    assert fake.sizes == [3]  # no split
+@pytest.mark.asyncio
+async def test_summarize_shrinks_window_until_it_fits(monkeypatch):
+    _mock_openai_config(monkeypatch)
+    cells_result = {'cells': [{'cell_type': 'markdown', 'source': ['# Top']}] + [
+        {'_index': i, 'cell_type': 'code', 'source': ['x' * 200]}
+        for i in range(1, 22)
+    ]}
+    fake = _FakeSummarizer(max_chars=900)
+    out = await NBSearchHandler._summarize(
+        fake, 'focus', 'f.ipynb', cells_result, [11], 'instr', 'echo')
+    assert len(out) <= 900               # returned a fitting render
+    assert len(fake.attempts) > 1        # shrank at least once
+    assert fake.attempts[0] > fake.attempts[-1]
 
 
-async def test_summarize_adaptive_map_reduce_on_overflow():
-    # Chunks larger than 2 cells overflow, forcing a split of the 4-cell input.
-    fake = _FakeSummarizer(max_fit=2)
-    result = await fake._summarize_adaptive(
-        'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
-    assert result.startswith('summary-of-')
-    # First attempt (4) overflows; halves of 2 fit; reduce of 2 partials fits.
-    assert fake.sizes[0] == 4
-    assert 2 in fake.sizes
+@pytest.mark.asyncio
+async def test_summarize_falls_back_to_minimal_document(monkeypatch):
+    # Only the header (no cells) fits; the shrink ladder must reach it.
+    _mock_openai_config(monkeypatch)
+    cells_result = {'cells': [
+        {'_index': 0, 'cell_type': 'code', 'source': ['ZZZBODY ' * 80]},
+        {'_index': 1, 'cell_type': 'code', 'source': ['ZZZBODY ' * 80]},
+    ]}
+    fake = _FakeSummarizer(max_chars=40)
+    out = await NBSearchHandler._summarize(
+        fake, 'focus', 'nb.ipynb', cells_result, [0], 'instr', 'echo')
+    assert 'ZZZBODY' not in out   # all cell content dropped
+    assert fake.attempts[-1] <= 40
 
 
-async def test_summarize_adaptive_propagates_non_context_errors():
+@pytest.mark.asyncio
+async def test_summarize_propagates_non_context_errors(monkeypatch):
+    _mock_openai_config(monkeypatch)
+
     class _Boom(_FakeSummarizer):
         async def _run_summary(self, *args, **kwargs):
+            self.attempts.append(0)
             raise ValueError('bad api key')
 
-    fake = _Boom(max_fit=2)
+    fake = _Boom(max_chars=10)
     with pytest.raises(ValueError):
-        await fake._summarize_adaptive(
-            'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
-    # No split attempted on a non-context error.
-    assert fake.sizes == []
+        await NBSearchHandler._summarize(
+            fake, 'f', 'n.ipynb',
+            {'cells': [{'_index': 0, 'cell_type': 'code', 'source': ['a']}]},
+            [0], 'instr', 'echo')
+    assert fake.attempts == [0]   # no shrink retries on a non-context error
 
 
-async def test_summarize_adaptive_depth_is_bounded():
-    # Nothing ever fits, so the floor (truncate + final attempt) must raise
-    # rather than recurse forever.
-    fake = _FakeSummarizer(max_fit=0)
-    with pytest.raises(RuntimeError):
-        await fake._summarize_adaptive(
-            'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
-    # Bounded: never explodes into an unbounded number of calls.
-    assert len(fake.sizes) <= 2 ** (_NBSEARCH_SUMMARY_MAX_DEPTH + 2)
+@pytest.mark.asyncio
+async def test_summarize_propagates_cancellation(monkeypatch):
+    _mock_openai_config(monkeypatch)
 
-
-async def test_summarize_adaptive_propagates_cancellation():
-    # A client-disconnect cancellation must abort, never be mistaken for a
-    # context overflow and trigger map-reduce.
     class _Cancelled(_FakeSummarizer):
         async def _run_summary(self, *args, **kwargs):
-            self.sizes.append(0)
+            self.attempts.append(0)
             raise asyncio.CancelledError()
 
-    fake = _Cancelled(max_fit=2)
+    fake = _Cancelled(max_chars=10)
     with pytest.raises(asyncio.CancelledError):
-        await fake._summarize_adaptive(
-            'openai', 'm', 'k', '', {}, _build_summary_messages, [1, 2, 3, 4])
-    # Only the first attempt ran; no split.
-    assert fake.sizes == [0]
+        await NBSearchHandler._summarize(
+            fake, 'f', 'n.ipynb',
+            {'cells': [{'_index': 0, 'cell_type': 'code', 'source': ['a']}]},
+            [0], 'instr', 'echo')
+    assert fake.attempts == [0]
 
