@@ -20,6 +20,19 @@ def NBSearchDB(*args, **kwargs):
     return _NBSearchDB(*args, **kwargs)
 
 
+# A tool with no useful action, attached to summary requests when
+# summaryToolPriming is enabled: its mere presence shifts Gemma out of its
+# chain-of-thought narration mode. tool_choice stays 'auto' (the priming has no
+# effect under 'none'); a guard below handles the model occasionally calling it.
+_SUMMARY_PRIMING_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'noop',
+        'description': 'Unused. Do not call this; answer directly.',
+        'parameters': {'type': 'object', 'properties': {}},
+    },
+}
+
 _NBSEARCH_NOTEBOOK_FL = [
     'id',
     'filename',
@@ -57,36 +70,39 @@ _NBSEARCH_REFERENCE_CELL_COUNT = 10000
 _NBSEARCH_CELLS_PAGE_LIMIT_BYTES = 100 * 1024
 _NBSEARCH_CELLS_MAX_LIMIT = 50
 
-# When a summarization request overflows the model's context window (common
-# with small-context local models), the input is split and summarized
-# recursively (map-reduce). The depth is bounded so a pathologically small
-# context cannot recurse forever; at the floor the content is truncated.
-_NBSEARCH_SUMMARY_MAX_DEPTH = 4
-_NBSEARCH_SUMMARY_FLOOR_CHARS = 2000
+# Summaries feed the search-matched cells plus a neighbor window of `±k` cells
+# (whole cells, never mid-cell truncated — partial code invites hallucination)
+# together with the notebook's heading outline for global context. On a context
+# overflow the window shrinks down this ladder; at k=0 (matched cells only) a
+# residual overflow drops matched cells from the tail.
+_NBSEARCH_WINDOW_K_LADDER = (10, 5, 2, 1, 0)
 
 # System prompts for the two summary flavors (searchNotebooks relevance line vs
 # summaryCellsFromSearch content paragraph). Both cite cell indexes/ranges.
+# The notebook is given as Markdown (headings = structure, fenced blocks =
+# code), shared per the user-approved Privacy filter. "!matched!" flags a part
+# that matched the search. Summaries refer to locations by section heading,
+# never by cell number (small models miscount indexes).
 _NBSEARCH_RESULT_INSTRUCTION = (
-    'Summarize why this notebook is relevant to the user focus. '
-    'Use only the provided cells, shared according to the user-approved Privacy filter setting. '
-    'Include the supporting cell index or range in the sentence, '
-    'such as "セル12-14では...". '
-    'Return one concise Japanese sentence.'
+    'The notebook below is given as Markdown; headings show its structure, '
+    'fenced blocks are code, and a "!matched!" line marks a part that matched '
+    'the search. Summarize why this notebook is relevant to the user focus, '
+    'using only the provided content and referring to locations by section '
+    'heading (never by cell number). Return one concise Japanese sentence.'
 )
 _NBSEARCH_CELLS_INSTRUCTION = (
-    'Summarize the provided notebook cells for the user focus. '
-    'The cells are shared according to the user-approved Privacy filter setting. '
-    'The summary is used to decide which raw cells to read next. '
-    'Always include relevant cell indexes or ranges in the summary. '
-    'Use the format "セル12" for one cell and "セル12-18" for a range. '
-    'Do not return raw cell contents. '
-    'Return one concise Japanese paragraph.'
+    'The notebook below is given as Markdown; headings show its structure, '
+    'fenced blocks are code, and "!matched!" lines mark parts that matched the '
+    'search. Summarize the content relevant to the user focus, using only the '
+    'provided content and referring to locations by section heading (never by '
+    'cell number). Do not copy cell contents verbatim. Return one concise '
+    'Japanese paragraph.'
 )
 
 # Substrings identifying a "prompt exceeds context window" error across
 # providers and local OpenAI-compatible servers. Matching is best-effort: a
-# miss re-raises (same behavior as before) and a false match only triggers a
-# needless but still-correct map-reduce pass.
+# miss re-raises and a false match only triggers a needless but still-correct
+# window-shrink pass.
 _CONTEXT_EXCEEDED_MARKERS = (
     'exceed_context_size_error',
     'exceeds the available context size',
@@ -101,15 +117,59 @@ def _is_context_exceeded(exc):
     return any(marker in text for marker in _CONTEXT_EXCEEDED_MARKERS)
 
 
-def _truncate_for_floor(value, limit=_NBSEARCH_SUMMARY_FLOOR_CHARS):
-    """Recursively clip string values so a floor-level retry can fit."""
-    if isinstance(value, str):
-        return value[:limit]
-    if isinstance(value, dict):
-        return {k: _truncate_for_floor(v, limit) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_truncate_for_floor(v, limit) for v in value]
-    return value
+def _cell_source_text(cell):
+    source = cell.get('source')
+    if isinstance(source, list):
+        return ''.join(source)
+    return source or ''
+
+
+def _cell_headings(cell):
+    """ATX heading lines of a markdown cell (the structural backbone)."""
+    if cell.get('cell_type') != 'markdown':
+        return []
+    return [
+        line.rstrip() for line in _cell_source_text(cell).splitlines()
+        if line.lstrip().startswith('#')
+    ]
+
+
+def _window_indexes(matched_indexes, k):
+    """Cell indexes within `±k` of each matched index (or of the top when there
+    is no match)."""
+    keep = set()
+    for anchor in matched_indexes or [0]:
+        keep.update(range(anchor - k, anchor + k + 1))
+    return keep
+
+
+def _render_markdown(cells, matched_indexes, window_keep, backbone_keep):
+    """Render cells as a Markdown document for summarization.
+
+    Cells in `window_keep` render in full (markdown verbatim, code fenced);
+    cells in `backbone_keep` keep only their heading lines (the structural
+    backbone for global context); others are dropped. A matched cell is
+    preceded by a "!matched!" marker line. No cell indexes appear — small models
+    cite them poorly, so relevance is carried by the marker, not numbers.
+    """
+    matched = set(matched_indexes)
+    parts = []
+    for cell in cells:
+        index = cell.get('_index', 0)
+        if index in window_keep:
+            text = _cell_source_text(cell).strip()
+            block = text if cell.get('cell_type') == 'markdown' else f'```\n{text}\n```'
+        elif index in backbone_keep:
+            headings = _cell_headings(cell)
+            if not headings:
+                continue
+            block = '\n'.join(headings)
+        else:
+            continue
+        if index in matched:
+            parts.append('!matched!')
+        parts.append(block)
+    return '\n\n'.join(parts)
 
 
 def _solr_phrase(value):
@@ -161,7 +221,10 @@ def _shape_nbsearch_notebook_reference(doc, query):
     return {
         'filename': doc['filename'],
         'notebookId': doc['id'],
+        # nblibram fetch (all cells); kept distinct from the Solr query below.
         'query': {'start': 0},
+        # The original Solr query, reused to locate matched cells for summaries.
+        'solrQuery': query,
         'start': None,
         'count': _NBSEARCH_REFERENCE_CELL_COUNT,
     }
@@ -207,9 +270,9 @@ def _estimate_json_size(value, limit):
 def _source_only_cell(cell):
     if not isinstance(cell, dict):
         return cell
-    result = {}
-    if '_index' in cell:
-        result['_index'] = cell['_index']
+    # nblibram omits `_index` for cell 0 (JSON omitempty on the zero int), so
+    # default it to 0 — windowing and TOC matching key off this index.
+    result = {'_index': cell.get('_index', 0)}
     if 'cell_type' in cell:
         result['cell_type'] = cell['cell_type']
     if 'source' in cell:
@@ -221,8 +284,8 @@ def _source_only_cells(cells_result):
     """Flatten an nblibram cells_result into a source-only cell list.
 
     Outputs are dropped (summaries judge relevance from source, and outputs
-    bloat the context). The list is the unit map-reduce splits to fit the model
-    context, so each cell keeps its `_index` for citing ranges.
+    bloat the context). Each cell keeps its `_index` so the summary window can
+    select whole cells and cite ranges.
     """
     return [_source_only_cell(cell) for cell in cells_result['cells']]
 
@@ -549,8 +612,10 @@ class NBSearchHandler(APIHandler):
             bool(data.get('noFilter')),
         )
         cell_count = len(cells['cells'])
-        # map-reduce covers every cell, so all cells are in scope.
-        coverage = f'full {cell_count}/{cell_count} cells'
+        matched_indexes = await self._matched_cell_indexes(
+            db, reference['notebookId'], reference.get('solrQuery'),
+        )
+        coverage = f'{len(matched_indexes)} matched / {cell_count} cells'
         self._emit_progress({'phase': 'summarize', 'detail': 'summarizing cells'})
         return {
             'type': 'summaryCellsFromSearch',
@@ -562,6 +627,7 @@ class NBSearchHandler(APIHandler):
                 data['focus'],
                 reference['filename'],
                 cells,
+                matched_indexes,
                 coverage,
             ),
             'readAction': {
@@ -656,6 +722,21 @@ class NBSearchHandler(APIHandler):
             if base_url:
                 kwargs['base_url'] = base_url
             client = routes.AsyncOpenAI(**kwargs)
+            if base_url:
+                # Custom endpoint (vLLM etc.): use chat/completions like the
+                # chat path; its Responses API leaks reasoning into the summary.
+                create = {'model': model, 'messages': messages}
+                if routes._advanced_flag(
+                        config, 'summaryToolPriming', routes._SUMMARY_TOOL_PRIMING):
+                    create['tools'] = [_SUMMARY_PRIMING_TOOL]
+                    create['tool_choice'] = 'auto'
+                msg = (await client.chat.completions.create(**create)).choices[0].message
+                if not (msg.content or '').strip() and msg.tool_calls:
+                    # Model called the priming tool instead of answering; retry
+                    # once without it so the summary isn't lost.
+                    msg = (await client.chat.completions.create(
+                        model=model, messages=messages)).choices[0].message
+                return (msg.content or '').strip()
             response = await client.responses.create(model=model, input=messages)
             return response.output_text.strip()
         if provider == 'enki-gate':
@@ -676,64 +757,45 @@ class NBSearchHandler(APIHandler):
             ).strip()
         raise tornado.web.HTTPError(400, reason=f'Unknown provider: {provider}')
 
-    async def _summarize_adaptive(
-        self, provider, model, api_key, base_url, config, build_messages,
-        segments, depth=0
-    ):
-        """Summarize `segments`, recursively splitting on context overflow.
+    async def _matched_cell_indexes(self, db, notebook_id, solr_query):
+        """Cell indexes in `notebook_id` matching the search query, via the
+        jupyter-cell core. Returns [] on no match or query error, so the window
+        falls back to the notebook's start."""
+        params = {
+            'q': solr_query or '*:*',
+            'fq': f'notebook_id:{_solr_phrase(notebook_id)}',
+            'fl': 'index',
+            'rows': _NBSEARCH_REFERENCE_CELL_COUNT,
+            'wt': 'json',
+        }
+        url = urljoin(
+            db.solr_base_url + '/',
+            f'solr/{db.solr_cell}/select?{urlencode(params, doseq=True)}',
+        )
+        response = await AsyncHTTPClient().fetch(
+            HTTPRequest(url, method='GET', **self._http_kwargs(db)),
+            raise_error=False,
+        )
+        if response.code >= 400:
+            self.log.warning(
+                'nbsearch cell-match query failed (status=%s, notebook_id=%s); '
+                'summarizing from notebook start', response.code, notebook_id,
+            )
+            return []
+        docs = json.loads(response.body)['response']['docs']
+        return sorted({d['index'] for d in docs if 'index' in d})
 
-        Normal-size inputs take a single request. Only when the model reports a
-        context-window overflow do we split the segments in half, summarize each
-        half, then summarize the two partial summaries (map-reduce). Recursion
-        is bounded by `_NBSEARCH_SUMMARY_MAX_DEPTH`; at the floor the content is
-        truncated for one final attempt. Non-overflow errors propagate.
-        """
-        try:
-            return await self._run_summary(
-                provider, model, api_key, base_url, config,
-                build_messages(segments)
-            )
-        except Exception as exc:
-            if not _is_context_exceeded(exc):
-                raise
-            if len(segments) <= 1 or depth >= _NBSEARCH_SUMMARY_MAX_DEPTH:
-                self.log.warning(
-                    'nbsearch summary context overflow at floor '
-                    '(segments=%d, depth=%d); truncating input',
-                    len(segments), depth,
-                )
-                return await self._run_summary(
-                    provider, model, api_key, base_url, config,
-                    build_messages(_truncate_for_floor(segments))
-                )
-            self.log.info(
-                'nbsearch summary context overflow; splitting %d segments '
-                '(depth=%d)', len(segments), depth,
-            )
-            self._emit_progress({
-                'phase': 'summarize',
-                'detail': f'large notebook; summarizing in parts (depth {depth + 1})',
-            })
-            mid = len(segments) // 2
-            partials = []
-            for chunk in (segments[:mid], segments[mid:]):
-                partials.append(await self._summarize_adaptive(
-                    provider, model, api_key, base_url, config, build_messages,
-                    chunk, depth + 1,
-                ))
-            return await self._summarize_adaptive(
-                provider, model, api_key, base_url, config, build_messages,
-                partials, depth + 1,
-            )
-
-    async def _summarize(self, focus, filename, cells_result, instruction,
-                         echo_text, extra=None):
+    async def _summarize(self, focus, filename, cells_result, matched_indexes,
+                         instruction, echo_text, extra=None):
         """Summarize a notebook's cells for `focus`, fitting the model context.
 
-        Cells are reduced to source-only and summarized via map-reduce
-        (`_summarize_adaptive`), which splits the cell list to fit any context
-        window. `instruction` is the system prompt; `extra` adds fields to the
-        user payload (e.g. coverage).
+        The notebook is rendered as Markdown: a heading backbone for global
+        context, plus the search-matched cells with a neighbor window shown in
+        full and flagged with a marker. On a context overflow the input shrinks
+        until it fits — first the full-content window (`_NBSEARCH_WINDOW_K_LADDER`
+        then dropping matched cells from the tail), then the heading backbone —
+        so even the smallest payload is guaranteed to fit. `extra` adds header
+        lines (e.g. coverage).
         """
         from jupyter_mynerva import routes
 
@@ -742,32 +804,62 @@ class NBSearchHandler(APIHandler):
         if provider == 'echo':
             return echo_text
         cells = _source_only_cells(cells_result)
+        backbone = {c['_index'] for c in cells if _cell_headings(c)}
 
-        def build_messages(segments):
-            payload = {'focus': focus, 'filename': filename}
-            if extra:
-                payload.update(extra)
-            payload['cells'] = segments
-            return [
-                {'role': 'system', 'content': instruction},
-                {'role': 'user',
-                 'content': json.dumps(payload, ensure_ascii=False)},
-            ]
+        async def attempt(window_keep, backbone_keep):
+            header = f'focus: {focus}\nnotebook: {filename}'
+            if extra and extra.get('coverage'):
+                header += f"\ncoverage: {extra['coverage']}"
+            document = _render_markdown(
+                cells, matched_indexes, window_keep, backbone_keep)
+            return await self._run_summary(
+                provider, model, api_key, base_url, config,
+                [
+                    {'role': 'system', 'content': instruction},
+                    {'role': 'user', 'content': f'{header}\n\n{document}'},
+                ],
+            )
 
-        return await self._summarize_adaptive(
-            provider, model, api_key, base_url, config, build_messages, cells
-        )
+        async def shrink(stages):
+            last_exc = None
+            for window_keep, backbone_keep in stages:
+                try:
+                    return await attempt(window_keep, backbone_keep)
+                except Exception as exc:
+                    if not _is_context_exceeded(exc):
+                        raise
+                    last_exc = exc
+            raise last_exc
 
-    async def _summarize_result(self, focus, filename, cells_result):
+        def tail_drop(indexes):
+            ordered = sorted(indexes)
+            while ordered:
+                ordered = ordered[:-1]
+                yield set(ordered)
+
+        stages = [
+            (_window_indexes(matched_indexes, k), backbone)
+            for k in _NBSEARCH_WINDOW_K_LADDER
+        ]
+        # k=0 still overflows: drop matched cells (full content) from the tail.
+        stages += [(w, backbone) for w in tail_drop(_window_indexes(matched_indexes, 0))]
+        # Backbone alone still overflows: drop heading cells from the tail.
+        stages += [(set(), bb) for bb in tail_drop(backbone)]
+        return await shrink(stages)
+
+    async def _summarize_result(self, focus, filename, cells_result, matched_indexes):
         return await self._summarize(
-            focus, filename, cells_result, _NBSEARCH_RESULT_INSTRUCTION,
+            focus, filename, cells_result, matched_indexes,
+            _NBSEARCH_RESULT_INSTRUCTION,
             f'{filename} は検索 focus に関連する notebook です。'
             '関連箇所は提示されたセル番号を確認してください。',
         )
 
-    async def _summarize_search_cells(self, focus, filename, cells_result, coverage):
+    async def _summarize_search_cells(self, focus, filename, cells_result,
+                                      matched_indexes, coverage):
         return await self._summarize(
-            focus, filename, cells_result, _NBSEARCH_CELLS_INSTRUCTION,
+            focus, filename, cells_result, matched_indexes,
+            _NBSEARCH_CELLS_INSTRUCTION,
             f'{filename} は focus に関連するセル範囲を含みます。'
             '要約内のセル番号を使って getCellsFromSearch で詳細を確認してください。',
             extra={'coverage': coverage},
@@ -785,6 +877,7 @@ class NBSearchHandler(APIHandler):
         reference = _shape_nbsearch_notebook_reference(doc, query)
         _NBSEARCH_REFERENCE_CACHE[reference_id] = reference
         cells = await self._get_search_reference_cells(db, reference, no_filter)
+        matched_indexes = await self._matched_cell_indexes(db, doc['id'], query)
         references = [{
             'type': 'summaryCellsFromSearch',
             'referenceId': reference_id,
@@ -796,6 +889,7 @@ class NBSearchHandler(APIHandler):
                 focus,
                 doc['filename'],
                 cells,
+                matched_indexes,
             ),
             'references': references,
         }
