@@ -216,6 +216,24 @@
   padding: 8px;
 }
 
+.jp-Mynerva-compaction-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 4px;
+  color: var(--jp-content-font-color3);
+  font-size: var(--jp-ui-font-size0);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.jp-Mynerva-compaction-divider::before,
+.jp-Mynerva-compaction-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--jp-border-color2);
+}
+
 .jp-Mynerva-message {
   margin-bottom: 8px;
   padding: 8px;

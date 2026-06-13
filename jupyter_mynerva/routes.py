@@ -650,11 +650,32 @@ def _block_stop(handler, content_type, **metadata):
     _send_sse(handler, event)
 
 
+# Substrings identifying a "prompt exceeds context window" error across
+# providers and OpenAI-compatible servers. Normalized into a `context_overflow`
+# error code so the client can compact the history and retry, regardless of
+# provider.
+_CONTEXT_OVERFLOW_MARKERS = (
+    'maximum context length',
+    'context_length_exceeded',
+    'context window',
+    'exceeds the available context size',
+    'exceed_context_size_error',
+    'too many tokens',
+    'input is too long',
+)
+
+
+def _is_context_overflow(exc):
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
 def sse_serializer(func):
     """Decorator: wraps a serializer with init_sse / error handling / finish_sse.
 
     The decorated function must be an async coroutine taking (handler, ...).
-    Any exception is caught and emitted as an SSE error event.
+    Any exception is caught and emitted as an SSE error event; a context-window
+    overflow is tagged with code 'context_overflow' so the client can compact.
     _finish_sse runs in finally.
     """
     @functools.wraps(func)
@@ -663,7 +684,10 @@ def sse_serializer(func):
         try:
             await func(handler, *args, **kwargs)
         except Exception as e:
-            _send_sse(handler, {'type': 'error', 'error': str(e)})
+            event = {'type': 'error', 'error': str(e)}
+            if _is_context_overflow(e):
+                event['code'] = 'context_overflow'
+            _send_sse(handler, event)
         finally:
             _finish_sse(handler)
 

@@ -51,6 +51,9 @@ interface IMessage {
   // User: results of executed tool calls, sent back to the LLM.
   toolResults?: IToolResult[];
   generated?: boolean; // Auto-generated messages (show brief in UI)
+  // Context-compaction digest of all turns before it. Shown as a divider; when
+  // sending, only this message and everything after the last digest are sent.
+  digest?: boolean;
 }
 
 /** The completed result of one streamed chat turn. */
@@ -260,7 +263,11 @@ async function sendChat(
         const parsed = JSON.parse(payload);
 
         if (parsed.type === 'error') {
-          throw new Error(parsed.error);
+          const err: Error & { code?: string } = new Error(parsed.error);
+          if (parsed.code) {
+            err.code = parsed.code;
+          }
+          throw err;
         } else if (parsed.type === 'content_block_start') {
           callbacks.onContentBlockStart(parsed.content_type, parsed);
         } else if (parsed.type === 'content_block_delta') {
@@ -756,8 +763,10 @@ function SettingsView({
     defaultsUnavailable !== null ? false : (config.useDefault ?? false)
   );
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
-  const [relaxNarration, setRelaxNarration] = React.useState(relaxToolNarration);
-  const [summaryPriming, setSummaryPriming] = React.useState(summaryToolPriming);
+  const [relaxNarration, setRelaxNarration] =
+    React.useState(relaxToolNarration);
+  const [summaryPriming, setSummaryPriming] =
+    React.useState(summaryToolPriming);
   const initialProvider = providers.some(p => p.id === config.provider)
     ? config.provider
     : providers[0]?.id || config.provider;
@@ -1092,6 +1101,16 @@ function toolCallToAction(toolCall: IToolCall): IAction {
 // and presenting the turn as-is.
 const MAX_RETRIES = 2;
 
+// Bounded compaction passes when a turn overflows the model's context window.
+const MAX_COMPACTIONS = 3;
+
+const COMPACT_INSTRUCTION =
+  'The conversation below no longer fits the model context window. Write a ' +
+  'compact digest that lets the assistant continue without the full history: ' +
+  "the user's goal, notebooks/cells already read and their gist, findings, " +
+  'decisions, and the next step. Keep concrete identifiers (filenames, section ' +
+  'names). Output only the digest, in the conversation language.';
+
 /**
  * Validate the model's turn before presenting it to the user. Returns the
  * problems to feed back to the model, or [] if the turn is acceptable. Add
@@ -1238,6 +1257,15 @@ function ChatView({
     <>
       <div className="jp-Mynerva-messages">
         {messages.map((msg, msgIndex) => {
+          // Compaction digests render as a divider, not a chat bubble: the turns
+          // they fold are still shown above; only digest-onward is sent.
+          if (msg.digest) {
+            return (
+              <div key={msgIndex} className="jp-Mynerva-compaction-divider">
+                Context compacted
+              </div>
+            );
+          }
           const actions = (msg.toolCalls || []).map(toolCallToAction);
           const pendingCount = actions.filter(
             (_, i) => getActionStatus(msgIndex, i) === 'pending'
@@ -1559,7 +1587,7 @@ function MynervaComponent({
   // Progress text for the action currently executing (shown on its card)
   const [actionProgress, setActionProgress] = React.useState('');
 
-  // Auto-save session when messages change
+  // Auto-save session when messages change (digest messages ride along)
   React.useEffect(() => {
     if (sessionId && messages.length > 0) {
       saveSession(sessionId, messages).catch(e => {
@@ -2307,12 +2335,28 @@ function MynervaComponent({
     return { role: 'user', content: text, generated: true };
   };
 
+  // Render a turn as plain text for the compaction digest. Flattening to one
+  // user message keeps it provider-agnostic (no tool-call pairing or
+  // role-alternation constraints).
+  const turnToTranscript = (m: IMessage): string => {
+    const role = m.role === 'assistant' ? 'Assistant' : 'User';
+    const parts: string[] = [];
+    if (m.content && !m.generated) {
+      parts.push(m.content);
+    }
+    (m.toolCalls || []).forEach(tc =>
+      parts.push(`→ ${tc.name}(${JSON.stringify(tc.input)})`)
+    );
+    (m.toolResults || []).forEach(r => parts.push(`← ${r.result}`));
+    return `${role}: ${parts.join('\n')}`;
+  };
+
   // Run one chat turn, feeding validation errors back to the model and retrying
-  // (bounded) until the turn is acceptable. Returns the message list to commit:
-  // only the final accepted assistant turn, not the intermediate correction
-  // round-trips (which are sent to the provider in-loop but never committed, so
-  // the approval machinery never sees a rejected turn's tool calls). The loop
-  // runs while `loading` is true, so the approval effects stay dormant.
+  // (bounded) until the turn is acceptable. The full conversation stays on
+  // screen; only what is SENT is compacted when it overflows the context
+  // window. Returns the message list to commit: the full history plus the
+  // accepted assistant turn (never the compacted/sent form, and not the
+  // intermediate correction round-trips).
   const runChatWithRetry = async (
     history: IMessage[],
     signal?: AbortSignal
@@ -2322,19 +2366,109 @@ function MynervaComponent({
       ...msgs
     ];
 
-    let apiMessages = history;
-    let result = await runChat(withSystem(apiMessages), signal);
+    // Single chokepoint for what is SENT: only the last digest message and
+    // everything after it (older turns are folded into that digest). Anything
+    // building a request from the history MUST go through here, or it would
+    // resend folded turns and overflow again.
+    const apiHistory = (msgs: IMessage[]): IMessage[] => {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].digest) {
+          return msgs.slice(i);
+        }
+      }
+      return msgs;
+    };
+
+    // On overflow, summarize the turns after the last digest (folding that
+    // digest in) up to the latest real user turn, and insert the new digest
+    // there. Older turns stay in `history` for display/archive; the digest's
+    // position in the array is the send boundary. Returns false when there is
+    // nothing new to fold.
+    const compact = async (): Promise<boolean> => {
+      let cut = -1;
+      for (let i = history.length - 1; i >= 0; i--) {
+        const m = history[i];
+        if (m.role === 'user' && !m.generated && !m.digest) {
+          cut = i;
+          break;
+        }
+      }
+      let lastDigest = -1;
+      for (let i = cut - 1; i >= 0; i--) {
+        if (history[i].digest) {
+          lastDigest = i;
+          break;
+        }
+      }
+      const from = lastDigest + 1;
+      if (from >= cut) {
+        return false;
+      }
+      const prior = lastDigest >= 0 ? `${history[lastDigest].content}\n\n` : '';
+      const transcript =
+        prior + history.slice(from, cut).map(turnToTranscript).join('\n\n');
+      const digestResult = await sendChat(
+        [
+          {
+            role: 'user',
+            content: `${COMPACT_INSTRUCTION}\n\n---\n${transcript}`
+          }
+        ],
+        [],
+        {
+          onContentBlockStart: () => undefined,
+          onContentBlockDelta: () => undefined,
+          onContentBlockStop: () => undefined,
+          onMessageDone: () => undefined
+        },
+        signal
+      );
+      const digest = digestResult.text.trim();
+      if (!digest) {
+        return false;
+      }
+      const digestMsg: IMessage = {
+        role: 'user',
+        content: `Earlier conversation summary:\n${digest}`,
+        generated: true,
+        digest: true
+      };
+      history = [...history.slice(0, cut), digestMsg, ...history.slice(cut)];
+      return true;
+    };
+
+    let tail: IMessage[] = [];
+    const send = async (): Promise<IChatResult> => {
+      for (let pass = 0; ; pass++) {
+        try {
+          return await runChat(
+            withSystem([...apiHistory(history), ...tail]),
+            signal
+          );
+        } catch (e) {
+          const code = (e as { code?: string }).code;
+          if (code !== 'context_overflow' || pass >= MAX_COMPACTIONS) {
+            throw e;
+          }
+          if (!(await compact())) {
+            throw e;
+          }
+        }
+      }
+    };
+
+    let result = await send();
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const errors = validateAssistantResult(result, relaxToolNarration);
       if (errors.length === 0) {
         break;
       }
-      apiMessages = [
-        ...apiMessages,
+      tail = [
+        ...tail,
         buildAssistantMessage(result),
         buildRetryFeedback(result, errors)
       ];
-      result = await runChat(withSystem(apiMessages), signal);
+      result = await send();
     }
     return [...history, buildAssistantMessage(result)];
   };

@@ -1599,6 +1599,32 @@ async def test_chat_openai_api_error():
 
 
 @pytest.mark.asyncio
+async def test_sse_serializer_tags_context_overflow():
+    @sse_serializer
+    async def boom(handler):
+        raise Exception("This model's maximum context length is 8192 tokens")
+
+    handler = MagicMock()
+    await boom(handler)
+    payloads, _ = _parse_sse_payloads(handler)
+    assert payloads[0]['type'] == 'error'
+    assert payloads[0].get('code') == 'context_overflow'
+
+
+@pytest.mark.asyncio
+async def test_sse_serializer_no_code_for_other_errors():
+    @sse_serializer
+    async def boom(handler):
+        raise Exception('API key invalid')
+
+    handler = MagicMock()
+    await boom(handler)
+    payloads, _ = _parse_sse_payloads(handler)
+    assert payloads[0]['type'] == 'error'
+    assert 'code' not in payloads[0]
+
+
+@pytest.mark.asyncio
 async def test_chat_openai_failed_event():
     handler = MagicMock()
     events = [
