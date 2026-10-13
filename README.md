@@ -314,22 +314,12 @@ If [nbsearch](https://github.com/NII-cloud-operation/nbsearch) is enabled in the
 ## Requirements
 
 - JupyterLab >= 4.0.0 or Notebook >= 7.0.0
-- [nblibram](https://github.com/NII-cloud-operation/nblibram) binary in `PATH`
+- [nblibram](https://github.com/NII-cloud-operation/nblibram) >= 2026.9.0 (installed automatically)
 
 ## Install
 
 ```bash
 pip install jupyter_mynerva
-```
-
-Install the nblibram binary (notebook query engine):
-
-```bash
-# Linux (amd64)
-wget -qO- https://github.com/NII-cloud-operation/nblibram/releases/latest/download/nblibram_linux_amd64.tar.gz | tar xz -C /usr/local/bin/ nblibram
-
-# macOS (Apple Silicon)
-wget -qO- https://github.com/NII-cloud-operation/nblibram/releases/latest/download/nblibram_darwin_arm64.tar.gz | tar xz -C /usr/local/bin/ nblibram
 ```
 
 ## Contributing

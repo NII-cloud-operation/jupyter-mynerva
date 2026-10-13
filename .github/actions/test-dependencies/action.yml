@@ -1,0 +1,11 @@
+name: Test dependencies
+description: Make nblibram wheels from TestPyPI available to fork builds
+runs:
+  using: composite
+  steps:
+    - if: github.repository != 'NII-cloud-operation/jupyter-mynerva'
+      shell: bash
+      run: |
+        python -m pip download --index-url https://test.pypi.org/simple/ \
+          --only-binary=:all: --no-deps nblibram --dest "$RUNNER_TEMP/nblibram-wheels"
+        echo "PIP_FIND_LINKS=$RUNNER_TEMP/nblibram-wheels" >> "$GITHUB_ENV"

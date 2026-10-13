@@ -37,7 +37,7 @@ def _load_jupyter_server_extension(server_app):
         server_app.log.warning(
             "nblibram not found in PATH. "
             "Notebook query features will not work. "
-            "Install from https://github.com/NII-cloud-operation/nblibram/releases"
+            "Activate the Python environment where Jupyter and nblibram are installed."
         )
 
     setup_route_handlers(server_app.web_app)

@@ -23,6 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
+    "nblibram>=2026.9.0",
     "jupyter_server>=2.4.0,<3",
     "openai>=1.0.0",
     "anthropic>=0.30.0",
