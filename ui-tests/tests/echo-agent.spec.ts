@@ -46,6 +46,8 @@ test.describe('Echo Agent', () => {
     );
     // Wait for at least 2 assistant messages (first = "Echo: requesting ...", second = echo of results)
     await expect(allMessages).toHaveCount(2, { timeout: 15000 });
+    // The loading placeholder also counts as a message; wait for completion.
+    await expect(input).toBeEnabled({ timeout: 15000 });
     const lastMessage = allMessages.last();
     return await lastMessage.textContent();
   }
