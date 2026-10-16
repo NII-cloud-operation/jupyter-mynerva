@@ -7,6 +7,9 @@ Releases from forks use TestPyPI and environment `testpypi`.
 The required version of nblibram must be available on PyPI before a production
 release of Mynerva.
 
+Use `YYYY.M.N` versions and `vYYYY.M.N` tags.
+Start `N` at `0` each month and increment it for subsequent releases.
+
 1. Update the version in `package.json` and the release notes in `CHANGELOG.md`.
 2. Commit the changes and push a matching version tag, such as `v<version>`.
 3. The Release workflow builds the packages, tests the wheel, and attaches the
