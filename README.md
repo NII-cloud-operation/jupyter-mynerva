@@ -314,7 +314,7 @@ If [nbsearch](https://github.com/NII-cloud-operation/nbsearch) is enabled in the
 ## Requirements
 
 - JupyterLab >= 4.0.0 or Notebook >= 7.0.0
-- [nblibram](https://github.com/NII-cloud-operation/nblibram) >= 2026.9.0 (installed automatically)
+- [nblibram](https://github.com/NII-cloud-operation/nblibram) (installed automatically when installing Mynerva via pip)
 
 ## Install
 

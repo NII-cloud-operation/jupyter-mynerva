@@ -30,8 +30,9 @@ jobs:
         GH_TOKEN: ${{ github.token }}
         RELEASE_TAG: ${{ github.ref_name }}
       run: |
+        previous_tag=$(gh release view --json tagName --jq .tagName)
         gh release create "$RELEASE_TAG" --verify-tag --draft \
-          --title "$RELEASE_TAG" --notes-file CHANGELOG.md dist/*
+          --title "$RELEASE_TAG" --generate-notes --notes-start-tag "$previous_tag" dist/*
 
   publish-pypi:
     if: github.event_name == 'release'
