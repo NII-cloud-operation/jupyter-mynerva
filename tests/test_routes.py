@@ -979,6 +979,20 @@ async def test_fetch_chat_models_openai_filters_and_caches(monkeypatch):
     MockOpenAI2.assert_not_called()
 
 
+async def test_fetch_chat_models_openai_includes_gpt6():
+    _chat_models_cache.clear()
+    response = _mock_models_response([
+        'gpt-5.2', 'gpt-6-astra', 'gpt-6.1-sol',
+        'gpt-5.2-2025-12-11', 'gpt-4o-audio-preview', 'text-embedding-3-small',
+    ])
+
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.models.list = AsyncMock(return_value=response)
+        result = await _fetch_chat_models('openai', 'test-key')
+
+    assert result == ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.2']
+
+
 async def test_fetch_chat_models_anthropic_filters_and_caches(monkeypatch):
     _chat_models_cache.clear()
     monkeypatch.setattr('jupyter_mynerva.routes._load_model_spec',
