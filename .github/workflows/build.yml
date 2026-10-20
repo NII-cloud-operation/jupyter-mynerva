@@ -151,6 +151,7 @@ jobs:
         sudo rm -rf $(which node)
         sudo rm -rf $(which node)
 
+        pip install "Brotli==1.1.0"
         pip install "jupyterlab>=4.0.0,<5" jupyter_mynerva*.whl
         python -m pip check
         nblibram version
