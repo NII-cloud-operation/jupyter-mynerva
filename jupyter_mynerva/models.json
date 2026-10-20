@@ -1,6 +1,7 @@
 {
   "openai": {
     "allow": [
+      "gpt-6*",
       "gpt-5*",
       "gpt-4.1*",
       "gpt-4o*",

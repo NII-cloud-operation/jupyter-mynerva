@@ -1,6 +1,6 @@
 {
     "name": "jupyter-mynerva",
-    "version": "2026.10.0",
+    "version": "2026.10.1",
     "description": "A JupyterLab extension that provides an LLM-powered assistant with deep understanding of notebook structure.",
     "keywords": [
         "jupyter",

@@ -137,7 +137,7 @@ async def test_load_config_missing_fields(monkeypatch, tmp_path):
 
     loaded = await load_config()
     assert loaded['provider'] == 'openai'
-    assert loaded['model'] == 'gpt-5.2'
+    assert loaded['model'] == 'gpt-6-luna'
     assert 'configWarning' in loaded
     assert 'provider' in loaded['configWarning']
     assert 'model' in loaded['configWarning']
@@ -977,6 +977,20 @@ async def test_fetch_chat_models_openai_filters_and_caches(monkeypatch):
         cached = await _fetch_chat_models('openai', 'admin-key')
     assert cached == ['gpt-5-mini', 'gpt-5.2']
     MockOpenAI2.assert_not_called()
+
+
+async def test_fetch_chat_models_openai_includes_gpt6():
+    _chat_models_cache.clear()
+    response = _mock_models_response([
+        'gpt-5.2', 'gpt-6-astra', 'gpt-6.1-sol',
+        'gpt-5.2-2025-12-11', 'gpt-4o-audio-preview', 'text-embedding-3-small',
+    ])
+
+    with patch('jupyter_mynerva.routes.AsyncOpenAI') as MockOpenAI:
+        MockOpenAI.return_value.models.list = AsyncMock(return_value=response)
+        result = await _fetch_chat_models('openai', 'test-key')
+
+    assert result == ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.2']
 
 
 async def test_fetch_chat_models_anthropic_filters_and_caches(monkeypatch):
