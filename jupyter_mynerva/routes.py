@@ -18,7 +18,7 @@ from pathlib import Path
 
 import cachetools
 from cryptography.fernet import InvalidToken
-import httpx
+import httpx2
 
 _log = logging.getLogger(__name__)
 
@@ -297,7 +297,7 @@ def _fetch_bedrock_models(api_key, region):
         return _bedrock_models_cache[cache_key]
     url = f'https://bedrock.{region}.amazonaws.com/inference-profiles'
     headers = {'Authorization': f'Bearer {api_key}'}
-    with httpx.Client(timeout=30) as client:
+    with httpx2.Client(timeout=30) as client:
         resp = client.get(url, headers=headers)
     if resp.status_code != 200:
         raise ValueError(
@@ -968,7 +968,7 @@ async def chat_bedrock_converse(handler, api_key, region, model, messages,
             _block_start(handler, kind)
             display_block = kind
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx2.AsyncClient(timeout=300) as client:
         async with client.stream('POST', url, headers=req_headers,
                                  content=json.dumps(body)) as resp:
             if resp.status_code != 200:

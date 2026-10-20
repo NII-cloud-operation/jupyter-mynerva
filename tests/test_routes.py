@@ -5,6 +5,8 @@ import os
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import brotli
+import httpx2
 import pytest
 import tornado.web
 from cryptography.fernet import Fernet
@@ -2171,7 +2173,7 @@ class _FakeStreamResponse:
 
 
 class _FakeAsyncClient:
-    """Stand-in for httpx.AsyncClient(...) — async ctx mgr returning self."""
+    """Stand-in for httpx2.AsyncClient(...) — async ctx mgr returning self."""
     def __init__(self, response, captured):
         self._response = response
         self._captured = captured
@@ -2289,9 +2291,15 @@ async def test_chat_bedrock_converse_basic_flow():
     ]
 
     captured = {}
-    response = _FakeStreamResponse(status_code=200, chunks=chunks)
-    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
-               return_value=_FakeAsyncClient(response, captured)):
+
+    def respond(request):
+        captured['url'] = str(request.url)
+        captured['method'] = request.method
+        captured['headers'] = request.headers
+        return httpx2.Response(200, stream=httpx2.ByteStream(b''.join(chunks)))
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
+    with patch('jupyter_mynerva.routes.httpx2.AsyncClient', return_value=client):
         await chat_bedrock_converse(
             handler, 'sk-bedrock', 'us-west-2',
             'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
@@ -2358,7 +2366,7 @@ async def test_chat_bedrock_converse_thinking_then_text():
         ),
     ]
     response = _FakeStreamResponse(status_code=200, chunks=chunks)
-    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+    with patch('jupyter_mynerva.routes.httpx2.AsyncClient',
                return_value=_FakeAsyncClient(response, {})):
         await chat_bedrock_converse(
             handler, 'k', 'us-east-1',
@@ -2409,7 +2417,7 @@ async def test_chat_bedrock_converse_tool_use():
         ),
     ]
     response = _FakeStreamResponse(status_code=200, chunks=chunks)
-    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+    with patch('jupyter_mynerva.routes.httpx2.AsyncClient',
                return_value=_FakeAsyncClient(response, {})):
         await chat_bedrock_converse(
             handler, 'k', 'us-east-1',
@@ -2436,7 +2444,7 @@ async def test_chat_bedrock_converse_http_error():
         chunks=[],
         error_body=b'{"message":"use case not approved"}',
     )
-    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+    with patch('jupyter_mynerva.routes.httpx2.AsyncClient',
                return_value=_FakeAsyncClient(response, {})):
         await chat_bedrock_converse(
             handler, 'k', 'us-east-1',
@@ -2462,7 +2470,7 @@ async def test_chat_bedrock_converse_exception_frame():
         ),
     ]
     response = _FakeStreamResponse(status_code=200, chunks=chunks)
-    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+    with patch('jupyter_mynerva.routes.httpx2.AsyncClient',
                return_value=_FakeAsyncClient(response, {})):
         await chat_bedrock_converse(
             handler, 'k', 'us-east-1',
@@ -2532,30 +2540,39 @@ class _FakeSyncClient:
         return self._response
 
 
-def test_fetch_bedrock_models_filters_active_system_defined():
+@pytest.mark.parametrize('encoding', ['identity', 'br'])
+def test_fetch_bedrock_models_filters_active_system_defined(encoding):
     _bedrock_models_cache.clear()
     captured = {}
-    response = _FakeSyncResponse(
-        status_code=200,
-        json_data={
-            'inferenceProfileSummaries': [
-                # included
-                {'inferenceProfileId': 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-                 'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
-                # included
-                {'inferenceProfileId': 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
-                 'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
-                # excluded: APPLICATION_PROFILE (user-created)
-                {'inferenceProfileId': 'user-defined-1',
-                 'status': 'ACTIVE', 'type': 'APPLICATION_PROFILE'},
-                # excluded: INACTIVE
-                {'inferenceProfileId': 'us.anthropic.claude-3-0-legacy-v1:0',
-                 'status': 'INACTIVE', 'type': 'SYSTEM_DEFINED'},
-            ]
-        },
-    )
-    with patch('jupyter_mynerva.routes.httpx.Client',
-               return_value=_FakeSyncClient(response, captured)):
+    body = json.dumps({
+        'inferenceProfileSummaries': [
+            # included
+            {'inferenceProfileId': 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+             'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+            # included
+            {'inferenceProfileId': 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+             'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+            # excluded: APPLICATION_PROFILE (user-created)
+            {'inferenceProfileId': 'user-defined-1',
+             'status': 'ACTIVE', 'type': 'APPLICATION_PROFILE'},
+            # excluded: INACTIVE
+            {'inferenceProfileId': 'us.anthropic.claude-3-0-legacy-v1:0',
+             'status': 'INACTIVE', 'type': 'SYSTEM_DEFINED'},
+        ]
+    }).encode()
+    if encoding == 'br':
+        body = brotli.compress(body)
+
+    def respond(request):
+        captured['url'] = str(request.url)
+        captured['headers'] = request.headers
+        return httpx2.Response(
+            200, headers={'Content-Encoding': encoding},
+            stream=httpx2.ByteStream(body),
+        )
+
+    client = httpx2.Client(transport=httpx2.MockTransport(respond))
+    with patch('jupyter_mynerva.routes.httpx2.Client', return_value=client):
         models = _fetch_bedrock_models('sk-key', 'us-west-2')
 
     assert captured['url'] == 'https://bedrock.us-west-2.amazonaws.com/inference-profiles'
@@ -2587,7 +2604,7 @@ def test_fetch_bedrock_models_cache_keyed_by_api_key():
              'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
         ]},
     )
-    with patch('jupyter_mynerva.routes.httpx.Client',
+    with patch('jupyter_mynerva.routes.httpx2.Client',
                return_value=_FakeSyncClient(response)):
         result = _fetch_bedrock_models('key-B', 'us-east-1')
 
@@ -2603,7 +2620,7 @@ def test_fetch_bedrock_models_empty_after_filter_raises():
                  'status': 'INACTIVE', 'type': 'SYSTEM_DEFINED'},
         ]},
     )
-    with patch('jupyter_mynerva.routes.httpx.Client',
+    with patch('jupyter_mynerva.routes.httpx2.Client',
                return_value=_FakeSyncClient(response)):
         with pytest.raises(ValueError, match='No matching inference profiles'):
             _fetch_bedrock_models('k', 'us-east-1')
@@ -2616,7 +2633,7 @@ def test_fetch_bedrock_models_http_error_raises():
         json_data=None,
         text='{"message":"not authorized"}',
     )
-    with patch('jupyter_mynerva.routes.httpx.Client',
+    with patch('jupyter_mynerva.routes.httpx2.Client',
                return_value=_FakeSyncClient(response)):
         with pytest.raises(ValueError, match=r'Bedrock list-profiles error \(403\).*not authorized'):
             _fetch_bedrock_models('k', 'us-east-1')
