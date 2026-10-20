@@ -374,7 +374,7 @@ Without `MYNERVA_SECRET_KEY`, API keys are stored unencrypted in `~/.mynerva/con
 Provide a default API key for users:
 
 ```bash
-MYNERVA_OPENAI_API_KEY=sk-... MYNERVA_DEFAULT_PROVIDER=openai MYNERVA_DEFAULT_MODEL=gpt-5.2 jupyter lab
+MYNERVA_OPENAI_API_KEY=sk-... MYNERVA_DEFAULT_PROVIDER=openai MYNERVA_DEFAULT_MODEL=gpt-6-luna jupyter lab
 ```
 
 Users will see a "Use default settings" option in the settings UI.

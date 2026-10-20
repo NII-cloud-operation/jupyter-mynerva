@@ -78,7 +78,7 @@ if os.environ.get('MYNERVA_ECHO_AGENT'):
     PROVIDERS.append({'id': 'echo', 'displayName': 'Echo (Testing)'})
 
 DEFAULT_PROVIDER = 'openai'
-DEFAULT_MODEL = 'gpt-5.2'
+DEFAULT_MODEL = 'gpt-6-luna'
 ENCRYPTED_PREFIX = 'encrypted:'
 
 # Default privacy filters (same as nbfilter)

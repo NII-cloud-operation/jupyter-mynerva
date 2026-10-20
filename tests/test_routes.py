@@ -137,7 +137,7 @@ async def test_load_config_missing_fields(monkeypatch, tmp_path):
 
     loaded = await load_config()
     assert loaded['provider'] == 'openai'
-    assert loaded['model'] == 'gpt-5.2'
+    assert loaded['model'] == 'gpt-6-luna'
     assert 'configWarning' in loaded
     assert 'provider' in loaded['configWarning']
     assert 'model' in loaded['configWarning']
